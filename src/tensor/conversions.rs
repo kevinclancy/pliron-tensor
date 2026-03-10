@@ -18,7 +18,7 @@ use pliron::{
     operation::Operation,
     region::Region,
     result::Result,
-    r#type::{TypePtr, Typed, type_cast},
+    r#type::{TypeObj, TypePtr, Typed, type_cast, type_impls},
     value::Value,
 };
 use pliron_common_dialects::cf::op_interfaces::YieldingRegion;
@@ -304,5 +304,18 @@ impl DialectConversion for TensorToMemref {
         let to_memref_op = op_cast::<dyn ToMemrefDialect>(&*op_dyn)
             .expect("Matched Op must implement ToMemrefDialect");
         to_memref_op.rewrite(ctx, rewriter)
+    }
+
+    fn can_convert_type(&mut self, _ctx: &Context, ty: Ptr<TypeObj>) -> bool {
+        type_impls::<dyn ToMemrefType>(&**ty.deref(_ctx))
+    }
+
+    fn convert_type(&mut self, _ctx: &mut Context, ty: Ptr<TypeObj>) -> Result<Ptr<TypeObj>> {
+        let to_memref_ty = type_cast::<dyn ToMemrefType>(&**ty.deref(_ctx)).map(|t| t.converter());
+        if let Some(to_memref_ty) = to_memref_ty {
+            to_memref_ty(ty, _ctx)
+        } else {
+            Ok(ty)
+        }
     }
 }

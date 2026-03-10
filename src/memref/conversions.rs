@@ -7,7 +7,7 @@ use pliron::{
             CallOpCallable, OneRegionInterface, OneResultInterface, SymbolOpInterface,
         },
         type_interfaces::{FloatTypeInterface, FunctionTypeInterface},
-        types::{IntegerType, Signedness},
+        types::Signedness,
     },
     context::{Context, Ptr},
     derive::{op_interface_impl, type_interface_impl},
@@ -29,7 +29,7 @@ use pliron::{
 };
 use pliron_common_dialects::{
     cf::{ToCFDialect, op_interfaces::YieldingRegion, ops::NDForOp},
-    index::{ops::IndexConstantOp, types::IndexType},
+    index::ops::IndexConstantOp,
 };
 use pliron_llvm::{
     ToLLVMType, ToLLVMTypeFn,
@@ -509,15 +509,16 @@ impl DialectConversion for MemrefToCF {
     }
 
     fn can_convert_type(&mut self, ctx: &Context, ty: Ptr<TypeObj>) -> bool {
-        ty.deref(ctx).downcast_ref::<IndexType>().is_some()
+        type_impls::<dyn ToLLVMType>(&**ty.deref(ctx))
     }
 
     fn convert_type(&mut self, ctx: &mut Context, ty: Ptr<TypeObj>) -> Result<Ptr<TypeObj>> {
-        if ty.deref(ctx).downcast_ref::<IndexType>().is_some() {
-            Ok(IntegerType::get(ctx, 64, Signedness::Signless).into())
-        } else {
-            Ok(ty)
-        }
+        let Some(ty_converter) =
+            type_cast::<dyn ToLLVMType>(&**ty.deref(ctx)).map(|t| t.converter())
+        else {
+            return Ok(ty);
+        };
+        ty_converter(ty, ctx)
     }
 
     fn rewrite(
