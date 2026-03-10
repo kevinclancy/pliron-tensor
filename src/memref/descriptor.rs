@@ -168,22 +168,14 @@ pub fn unpack_sizes<L: InsertionListener, I: Inserter<L>>(
 ) -> Vec<Value> {
     let rank = {
         let ty = descriptor.get_type(ctx).deref(ctx);
-        if let Some(ranked_ty) = ty.downcast_ref::<RankedMemrefType>() {
-            ranked_ty.rank()
-        } else {
-            // We're looking at the source operand already being converted
-            // to the LLVM struct type for the memref descriptor, so we need to get the memref type from the converter.
-            // TODO: Remove this once we have an OpAdaptor for rewriters that keeps
-            // a copy of the unmodified IR.
-            let struct_ty = ty
-                .downcast_ref::<StructType>()
-                .expect("Expected an LLVM struct type for the memref descriptor");
-            let arr_ty = struct_ty.field_type(3).deref(ctx);
-            let arr_ty = arr_ty
-                .downcast_ref::<pliron_llvm::types::ArrayType>()
-                .expect("Expected an array type for the sizes field in the memref descriptor");
-            arr_ty.size() as usize
-        }
+        let struct_ty = ty
+            .downcast_ref::<StructType>()
+            .expect("Expected an LLVM struct type for the memref descriptor");
+        let arr_ty = struct_ty.field_type(3).deref(ctx);
+        let arr_ty = arr_ty
+            .downcast_ref::<pliron_llvm::types::ArrayType>()
+            .expect("Expected an array type for the sizes field in the memref descriptor");
+        arr_ty.size() as usize
     };
     let sizes_arr = ExtractValueOp::new(ctx, descriptor, vec![3])
         .expect("Expected sizes array field in memref descriptor");
@@ -208,21 +200,14 @@ pub fn unpack_strides<L: InsertionListener, I: Inserter<L>>(
 ) -> Vec<Value> {
     let rank = {
         let ty = descriptor.get_type(ctx).deref(ctx);
-        if let Some(ranked_ty) = ty.downcast_ref::<RankedMemrefType>() {
-            ranked_ty.rank()
-        } else {
-            // We're looking at the source operand already being converted
-            // to the LLVM struct type for the memref descriptor, so we need to get the memref type from the converter.
-            // TODO: Remove this once we have an OpAdaptor for rewriters that keeps a copy of the unmodified IR.
-            let struct_ty = ty
-                .downcast_ref::<StructType>()
-                .expect("Expected an LLVM struct type for the memref descriptor");
-            let arr_ty = struct_ty.field_type(4).deref(ctx);
-            let arr_ty = arr_ty
-                .downcast_ref::<pliron_llvm::types::ArrayType>()
-                .expect("Expected an array type for the strides field in the memref descriptor");
-            arr_ty.size() as usize
-        }
+        let struct_ty = ty
+            .downcast_ref::<StructType>()
+            .expect("Expected an LLVM struct type for the memref descriptor");
+        let arr_ty = struct_ty.field_type(4).deref(ctx);
+        let arr_ty = arr_ty
+            .downcast_ref::<pliron_llvm::types::ArrayType>()
+            .expect("Expected an array type for the strides field in the memref descriptor");
+        arr_ty.size() as usize
     };
     let strides_arr = ExtractValueOp::new(ctx, descriptor, vec![4])
         .expect("Expected strides array field in memref descriptor");

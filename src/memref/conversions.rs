@@ -7,18 +7,18 @@ use pliron::{
             CallOpCallable, OneRegionInterface, OneResultInterface, SymbolOpInterface,
         },
         type_interfaces::{FloatTypeInterface, FunctionTypeInterface},
-        types::Signedness,
+        types::{IntegerType, Signedness},
     },
     context::{Context, Ptr},
     derive::{op_interface_impl, type_interface_impl},
     input_error,
     irbuild::{
+        dialect_conversion::{DialectConversion, DialectConversionRewriter, OperandConversionInfo},
         inserter::{BlockInsertionPoint, Inserter, OpInsertionPoint},
         listener::Recorder,
-        match_rewrite::{MatchRewrite, MatchRewriter},
         rewriter::{IRRewriter, Rewriter, ScopedRewriter},
     },
-    linked_list::{ContainsLinkedList, LinkedList},
+    linked_list::LinkedList,
     op::{Op, op_cast, op_impls},
     operation::Operation,
     region::Region,
@@ -29,7 +29,7 @@ use pliron::{
 };
 use pliron_common_dialects::{
     cf::{ToCFDialect, op_interfaces::YieldingRegion, ops::NDForOp},
-    index::ops::IndexConstantOp,
+    index::{ops::IndexConstantOp, types::IndexType},
 };
 use pliron_llvm::{
     ToLLVMType, ToLLVMTypeFn,
@@ -61,7 +61,12 @@ pub enum AllocOpRewriteError {
 // * Replace uses of the original [AllocOp]'s result with the newly built descriptor.
 #[op_interface_impl]
 impl ToCFDialect for AllocOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut MatchRewriter) -> Result<()> {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operand_info: &[OperandConversionInfo],
+    ) -> Result<()> {
         let result_ty = self.result_type(ctx);
         let memref_ty = TypePtr::<RankedMemrefType>::from_ptr(result_ty, ctx)
             .expect("Expected the result type of AllocOp to be a RankedMemrefType");
@@ -134,31 +139,14 @@ pub enum GenerateOpConversionErr {
 //   (the [GenerateOp]'s [YieldOp]'s argument) is [StoreOp]'d to the memref.
 #[op_interface_impl]
 impl ToCFDialect for GenerateOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut MatchRewriter) -> Result<()> {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operand_info: &[OperandConversionInfo],
+    ) -> Result<()> {
         // Compute the loop upper bounds based on the memref operand.
         let sizes = descriptor::unpack_sizes(ctx, rewriter, self.get_destination_memref(ctx));
-
-        // Update the argument types of the body entry block to LLVM types.
-        // TODO: We shouldn't be converting to LLVM types here, but without a
-        //   more general way to convert block arguments, this is a workaround.
-        let region = self.get_region(ctx);
-        let args = region
-            .deref(ctx)
-            .get_head()
-            .expect("GenerateOp region must have an entry block")
-            .deref(ctx)
-            .arguments()
-            .collect::<Vec<_>>();
-        for arg in args {
-            let arg_ty = arg.get_type(ctx);
-            let to_llvm_ty = type_cast::<dyn ToLLVMType>(&**arg_ty.deref(ctx))
-                .ok_or_else(|| {
-                    input_error!(arg.loc(ctx), GenerateOpConversionErr::UnsupportedIVType)
-                })?
-                .converter();
-            let llvm_ty = to_llvm_ty(arg_ty, ctx)?;
-            arg.set_type(ctx, llvm_ty);
-        }
 
         let const_index_0 = IndexConstantOp::new(ctx, 0);
         let const_index_1 = IndexConstantOp::new(ctx, 1);
@@ -241,7 +229,12 @@ impl ToCFDialect for GenerateOp {
 // of the element at the given indices in the memref and store the value to that address.
 #[op_interface_impl]
 impl ToCFDialect for StoreOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut MatchRewriter) -> Result<()> {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operand_info: &[OperandConversionInfo],
+    ) -> Result<()> {
         let value = self.get_value(ctx);
         let memref = self.get_destination_memref(ctx);
         let elem_ty = value.get_type(ctx);
@@ -259,7 +252,12 @@ impl ToCFDialect for StoreOp {
 // of the element at the given indices in the memref and load the value from that address.
 #[op_interface_impl]
 impl ToCFDialect for LoadOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut MatchRewriter) -> Result<()> {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operand_info: &[OperandConversionInfo],
+    ) -> Result<()> {
         let memref = self.get_source_memref(ctx);
         let elem_ty = self.get_result(ctx).get_type(ctx);
 
@@ -273,7 +271,12 @@ impl ToCFDialect for LoadOp {
 }
 
 trait BinaryMemrefOpToCF: BinaryMemrefOpInterface {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut MatchRewriter) -> Result<()> {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operand_info: &[OperandConversionInfo],
+    ) -> Result<()> {
         // Compute the loop upper bounds based on the memref operand.
         let sizes = descriptor::unpack_sizes(ctx, rewriter, self.get_result_memref(ctx));
 
@@ -295,13 +298,30 @@ trait BinaryMemrefOpToCF: BinaryMemrefOpInterface {
                 op_fn: fn(&mut Context, Value, Value, Ptr<TypeObj>) -> Ptr<Operation>,
                 elem_ty: Ptr<TypeObj>,
             }
+            let memref_result = self.get_result_memref(ctx);
+            let element_ty = {
+                let tys = &operand_info
+                    .iter()
+                    .find(|info| info.operand == memref_result)
+                    .expect("Expected to find operand info for the result memref")
+                    .previous_types;
+                // Find the most recently seen type that is a RankedMemrefType among the previous types of the memref.
+                tys
+                    .iter()
+                    .rev()
+                    .find_map(|ty| {
+                        let ty_ref = ty.deref(ctx);
+                        ty_ref.downcast_ref::<RankedMemrefType>().map(|t| t.element_type())
+                    })
+                    .expect("Expected to find a RankedMemrefType among the previous types of the memref")
+            };
             let mut state = State {
                 rewriter: scoped_rewriter,
                 memref_result: self.get_result_memref(ctx),
                 memref_lhs: self.get_lhs_memref(ctx),
                 memref_rhs: self.get_rhs_memref(ctx),
                 op_fn: self.build_llvm_op(),
-                elem_ty: self.get_element_type(ctx),
+                elem_ty: element_ty,
             };
             NDForOp::new(
                 ctx,
@@ -372,8 +392,13 @@ impl BinaryMemrefOpToCF for AddOp {
 
 #[op_interface_impl]
 impl ToCFDialect for AddOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut MatchRewriter) -> Result<()> {
-        <Self as BinaryMemrefOpToCF>::rewrite(self, ctx, rewriter)
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operand_info: &[OperandConversionInfo],
+    ) -> Result<()> {
+        <Self as BinaryMemrefOpToCF>::rewrite(self, ctx, rewriter, operand_info)
     }
 }
 
@@ -473,21 +498,34 @@ fn lower_llvm_load_op_to_llvm(load_op: &pliron_llvm::ops::LoadOp, ctx: &mut Cont
     Ok(())
 }
 
-/// Implement [MatchRewrite] for control-flow to CF conversion.
+/// Implement [DialectConversion] for control-flow to CF conversion.
 pub struct MemrefToCF;
 
-impl MatchRewrite for MemrefToCF {
-    fn r#match(&mut self, ctx: &Context, op: Ptr<Operation>) -> bool {
+impl DialectConversion for MemrefToCF {
+    fn can_convert_op(&mut self, ctx: &Context, op: Ptr<Operation>) -> bool {
         op_impls::<dyn ToCFDialect>(&*Operation::get_op_dyn(op, ctx))
             || Operation::get_op::<FuncOp>(op, ctx).is_some()
             || Operation::get_op::<pliron_llvm::ops::LoadOp>(op, ctx).is_some()
     }
 
+    fn can_convert_type(&mut self, ctx: &Context, ty: Ptr<TypeObj>) -> bool {
+        ty.deref(ctx).downcast_ref::<IndexType>().is_some()
+    }
+
+    fn convert_type(&mut self, ctx: &mut Context, ty: Ptr<TypeObj>) -> Result<Ptr<TypeObj>> {
+        if ty.deref(ctx).downcast_ref::<IndexType>().is_some() {
+            Ok(IntegerType::get(ctx, 64, Signedness::Signless).into())
+        } else {
+            Ok(ty)
+        }
+    }
+
     fn rewrite(
         &mut self,
         ctx: &mut Context,
-        rewriter: &mut MatchRewriter,
+        rewriter: &mut DialectConversionRewriter,
         op: Ptr<Operation>,
+        operand_info: &[OperandConversionInfo],
     ) -> Result<()> {
         if let Some(func_op) = Operation::get_op::<FuncOp>(op, ctx) {
             return lower_func_op_to_llvm(&func_op, ctx);
@@ -499,6 +537,6 @@ impl MatchRewrite for MemrefToCF {
         let op_dyn = Operation::get_op_dyn(op, ctx);
         let to_cf_op =
             op_cast::<dyn ToCFDialect>(&*op_dyn).expect("Matched Op must implement ToCFDialect");
-        to_cf_op.rewrite(ctx, rewriter)
+        to_cf_op.rewrite(ctx, rewriter, operand_info)
     }
 }

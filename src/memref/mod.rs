@@ -10,7 +10,7 @@ pub mod types;
 use pliron::{
     context::{Context, Ptr},
     derive::{op_interface, type_interface},
-    irbuild::match_rewrite::MatchRewriter,
+    irbuild::dialect_conversion::DialectConversionRewriter,
     op::Op,
     result::Result,
     r#type::{Type, TypeObj},
@@ -20,7 +20,7 @@ use pliron::{
 #[op_interface]
 pub trait ToMemrefDialect {
     /// Rewrite [self] to Memref dialect.
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut MatchRewriter) -> Result<()>;
+    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()>;
 
     fn verify(_op: &dyn Op, _ctx: &Context) -> Result<()>
     where

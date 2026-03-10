@@ -3,21 +3,18 @@
 use std::cell::Ref;
 
 use pliron::{
-    builtin::{
-        attributes::TypeAttr,
-        op_interfaces::{
-            AllOperandsOfType, AllResultsOfType, NOpdsInterface, NResultsInterface,
-            OneOpdInterface, SingleBlockRegionInterface,
-        },
+    builtin::op_interfaces::{
+        AllOperandsOfType, AllResultsOfType, NOpdsInterface, NResultsInterface, OneOpdInterface,
+        SingleBlockRegionInterface,
     },
-    context::{Context, Ptr},
+    context::Context,
     derive::op_interface,
-    dict_key,
     op::{Op, op_cast},
+    operation::Operation,
     result::Result,
-    r#type::{TypeObj, Typed, type_cast},
+    r#type::{Typed, type_cast},
     value::Value,
-    verify_err,
+    verify_err, verify_error,
 };
 use pliron_common_dialects::{cf::op_interfaces::YieldingRegion, index::types::IndexType};
 
@@ -89,6 +86,8 @@ pub enum CompatibleShapesOpErr {
         "Expected all operands and results to have the same shape (for non-dynamic dimensions) and rank"
     )]
     IncompatibleShapes,
+    #[error("Expected operand or result type to be of the specified ShapedType")]
+    NonInstantiatedType,
 }
 
 /// Tensor and Memref ops that have operands and results of the same
@@ -100,14 +99,18 @@ pub trait CompatibleShapesOp<T: ShapedType>: AllResultsOfType<T> + AllOperandsOf
         Self: Sized,
     {
         let op_ref = op.get_operation().deref(ctx);
-        let shapes = op_ref.results().chain(op_ref.operands()).map(|v| {
-            let ty = v.get_type(ctx);
-            let ty_ref = ty.deref(ctx);
-            // TODO: Use `downcast_ref::<T>` rather than `type_cast`.
-            let shaped_ty = type_cast::<dyn ShapedType>(&**ty_ref)
-                .expect("Expected operand and result types to be of the specified ShapedType");
-            shaped_ty.shape().clone()
-        });
+        let shapes = op_ref
+            .results()
+            .chain(op_ref.operands())
+            .map(|v| {
+                let ty = v.get_type(ctx);
+                let ty_ref = ty.deref(ctx);
+                let t = ty_ref.downcast_ref::<T>().ok_or_else(|| {
+                    verify_error!(op.loc(ctx), CompatibleShapesOpErr::NonInstantiatedType)
+                })?;
+                Ok(t.shape().clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let mut cur_shape: Option<Vec<Dimension>> = None;
         for shape in shapes {
@@ -143,7 +146,6 @@ pub trait CompatibleShapesOp<T: ShapedType>: AllResultsOfType<T> + AllOperandsOf
         let shapes = op_ref.results().chain(op_ref.operands()).map(|v| {
             let ty = v.get_type(ctx);
             let ty_ref = ty.deref(ctx);
-            // TODO: Use `downcast_ref::<T>` rather than `type_cast`.
             let shaped_ty = type_cast::<dyn ShapedType>(&**ty_ref)
                 .expect("Expected operand and result types to be of the specified ShapedType");
             shaped_ty.shape().clone()
@@ -174,15 +176,6 @@ pub trait CompatibleShapesOp<T: ShapedType>: AllResultsOfType<T> + AllOperandsOf
     }
 }
 
-// TODO: This shouldn't be needed as the types of the operands and
-// results should be sufficient to determine the element type, but
-// without a proper dialect conversion framework, it may be unavailable.
-dict_key!(
-    /// Attribute key for binary memref op element type.
-    ATTR_KEY_BINARY_MEMREF_OP_ELEMENT_TYPE,
-    "binary_memref_op_element_type"
-);
-
 /// Interface for binary arithmetic memref ops (e.g., AddOp).
 /// These ops must have exactly 3 operands, with the first operand
 /// being the result and the next two operands being the inputs.
@@ -193,6 +186,23 @@ pub trait BinaryMemrefOpInterface:
     + NOpdsInterface<3>
     + CompatibleShapesOp<RankedMemrefType>
 {
+    /// Create a new instance of the binary memref op with the specified operands.
+    fn new(ctx: &mut Context, res: Value, lhs: Value, rhs: Value) -> Self
+    where
+        Self: Sized,
+    {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            vec![res, lhs, rhs],
+            vec![],
+            0,
+        );
+        Operation::get_op(op, ctx)
+            .expect("Failed to create binary memref op with specified operands")
+    }
+
     /// Get the result memref operand.
     fn get_result_memref(&self, ctx: &Context) -> Value {
         self.get_operation().deref(ctx).get_operand(0)
@@ -208,39 +218,10 @@ pub trait BinaryMemrefOpInterface:
         self.get_operation().deref(ctx).get_operand(2)
     }
 
-    /// Get the element type of the memrefs, which is stored as an attribute.
-    fn get_element_type(&self, ctx: &Context) -> Ptr<TypeObj> {
-        self.get_operation()
-            .deref(ctx)
-            .attributes
-            .get::<TypeAttr>(&ATTR_KEY_BINARY_MEMREF_OP_ELEMENT_TYPE)
-            .expect("Binary memref op must have element type attribute")
-            .get_type(ctx)
-    }
-
-    /// Set the element type of the memrefs, which is stored as an attribute.
-    fn set_element_type(&self, ctx: &Context, elem_type: Ptr<TypeObj>) {
-        self.get_operation().deref_mut(ctx).attributes.set(
-            ATTR_KEY_BINARY_MEMREF_OP_ELEMENT_TYPE.clone(),
-            TypeAttr::new(elem_type),
-        );
-    }
-
-    fn verify(op: &dyn Op, ctx: &Context) -> Result<()>
+    fn verify(_op: &dyn Op, _ctx: &Context) -> Result<()>
     where
         Self: Sized,
     {
-        let self_op = op.get_operation().deref(ctx);
-        if self_op
-            .attributes
-            .get::<TypeAttr>(&ATTR_KEY_BINARY_MEMREF_OP_ELEMENT_TYPE)
-            .is_none()
-        {
-            return verify_err!(
-                op.loc(ctx),
-                "Binary memref op must have element type attribute"
-            );
-        }
         Ok(())
     }
 }

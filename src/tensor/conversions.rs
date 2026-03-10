@@ -8,10 +8,9 @@ use pliron::{
     },
     context::{Context, Ptr},
     derive::{op_interface_impl, type_interface_impl},
-    input_error,
     irbuild::{
+        dialect_conversion::{DialectConversion, DialectConversionRewriter, OperandConversionInfo},
         inserter::{BlockInsertionPoint, Inserter},
-        match_rewrite::{MatchRewrite, MatchRewriter},
         rewriter::Rewriter,
     },
     linked_list::ContainsLinkedList,
@@ -19,15 +18,16 @@ use pliron::{
     operation::Operation,
     region::Region,
     result::Result,
-    r#type::{TypeObj, TypePtr, Typed, type_cast},
+    r#type::{TypePtr, Typed, type_cast},
     value::Value,
 };
 use pliron_common_dialects::cf::op_interfaces::YieldingRegion;
-use pliron_llvm::{ToLLVMType, ops::FuncOp};
+use pliron_llvm::ops::FuncOp;
 
 use crate::{
     memref::{
         self, ToMemrefDialect, ToMemrefType, ToMemrefTypeFn, descriptor,
+        op_interfaces::BinaryMemrefOpInterface,
         ops::{AllocOp, YieldOp},
         type_interfaces::{Dimension, MultiDimensionalType, ShapedType},
         types::RankedMemrefType,
@@ -67,7 +67,7 @@ pub enum GenerateOpConversionErr {
 
 #[op_interface_impl]
 impl ToMemrefDialect for GenerateOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut MatchRewriter) -> Result<()> {
+    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
         let result_ty_ptr = self.get_result(ctx).get_type(ctx);
         let converter = {
             let result_ty_ref = result_ty_ptr.deref(ctx);
@@ -80,27 +80,7 @@ impl ToMemrefDialect for GenerateOp {
         let result_ty = TypePtr::<RankedMemrefType>::from_ptr(result_ty, ctx)
             .expect("Expected the converted type to be a RankedMemrefType");
 
-        // Update the argument types of the body entry block to LLVM types.
-        // TODO: We shouldn't be converting to LLVM types here, but without a
-        //   more general way to convert block arguments, this is a workaround.
         let region = self.get_region(ctx);
-        let args = region
-            .deref(ctx)
-            .get_head()
-            .expect("GenerateOp region must have an entry block")
-            .deref(ctx)
-            .arguments()
-            .collect::<Vec<_>>();
-        for arg in args {
-            let arg_ty = arg.get_type(ctx);
-            let to_llvm_ty = type_cast::<dyn ToLLVMType>(&**arg_ty.deref(ctx))
-                .ok_or_else(|| {
-                    input_error!(arg.loc(ctx), GenerateOpConversionErr::UnsupportedIVType)
-                })?
-                .converter();
-            let llvm_ty = to_llvm_ty(arg_ty, ctx)?;
-            arg.set_type(ctx, llvm_ty);
-        }
 
         let alloc = AllocOp::new(ctx, result_ty, self.dynamic_dimensions(ctx).clone());
         rewriter.append_op(ctx, alloc);
@@ -109,7 +89,7 @@ impl ToMemrefDialect for GenerateOp {
 
         struct State<'a> {
             yield_op: YieldOp,
-            rewriter: &'a mut MatchRewriter,
+            rewriter: &'a mut DialectConversionRewriter,
             inline_region: Ptr<Region>,
         }
         let generate_op = memref::ops::GenerateOp::new(
@@ -154,7 +134,7 @@ impl ToMemrefDialect for GenerateOp {
 
 #[op_interface_impl]
 impl ToMemrefDialect for ExtractOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut MatchRewriter) -> Result<()> {
+    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
         let operand = self.get_tensor_operand(ctx);
         let indices = self.get_index_operands(ctx);
         let result_ty = self.get_result(ctx).get_type(ctx);
@@ -168,7 +148,7 @@ impl ToMemrefDialect for ExtractOp {
 }
 
 trait BinaryTensorOpToMemref: BinaryTensorOpInterface {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut MatchRewriter) -> Result<()> {
+    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
         let lhs = self.get_operation().deref(ctx).get_operand(0);
         let rhs = self.get_operation().deref(ctx).get_operand(1);
 
@@ -203,7 +183,7 @@ trait BinaryTensorOpToMemref: BinaryTensorOpInterface {
 
         let alloc = AllocOp::new(ctx, result_ty, dynamic_dim_operands);
         rewriter.append_op(ctx, alloc);
-        let add = self.build_memref_op(ctx, alloc.get_result(ctx), lhs, rhs, elem_ty);
+        let add = self.build_memref_op(ctx, alloc.get_result(ctx), lhs, rhs);
         rewriter.append_operation(ctx, add);
         rewriter.replace_operation(ctx, self.get_operation(), alloc.get_operation());
         Ok(())
@@ -215,7 +195,6 @@ trait BinaryTensorOpToMemref: BinaryTensorOpInterface {
         res: Value,
         lhs: Value,
         rhs: Value,
-        elem_ty: Ptr<TypeObj>,
     ) -> Ptr<Operation>;
 }
 
@@ -226,22 +205,21 @@ impl BinaryTensorOpToMemref for AddOp {
         res: Value,
         lhs: Value,
         rhs: Value,
-        elem_ty: Ptr<TypeObj>,
     ) -> Ptr<Operation> {
-        memref::ops::AddOp::new(ctx, res, lhs, rhs, elem_ty).get_operation()
+        memref::ops::AddOp::new(ctx, res, lhs, rhs).get_operation()
     }
 }
 
 #[op_interface_impl]
 impl ToMemrefDialect for AddOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut MatchRewriter) -> Result<()> {
+    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
         <Self as BinaryTensorOpToMemref>::rewrite(self, ctx, rewriter)
     }
 }
 
 #[op_interface_impl]
 impl ToMemrefDialect for pliron_llvm::ops::LoadOp {
-    fn rewrite(&self, ctx: &mut Context, _rewriter: &mut MatchRewriter) -> Result<()> {
+    fn rewrite(&self, ctx: &mut Context, _rewriter: &mut DialectConversionRewriter) -> Result<()> {
         let loaded_ty = self.get_result(ctx).get_type(ctx);
         let to_memref_ty =
             type_cast::<dyn ToMemrefType>(&**loaded_ty.deref(ctx)).map(|t| t.converter());
@@ -303,11 +281,11 @@ fn lower_func_op_to_llvm(func_op: &FuncOp, ctx: &mut Context) -> Result<()> {
     Ok(())
 }
 
-/// Implement [MatchRewrite] for tensor to memref conversion.
+/// Implement [DialectConversion] for tensor to memref conversion.
 pub struct TensorToMemref;
 
-impl MatchRewrite for TensorToMemref {
-    fn r#match(&mut self, ctx: &Context, op: Ptr<Operation>) -> bool {
+impl DialectConversion for TensorToMemref {
+    fn can_convert_op(&mut self, ctx: &Context, op: Ptr<Operation>) -> bool {
         op_impls::<dyn ToMemrefDialect>(&*Operation::get_op_dyn(op, ctx))
             || Operation::get_op::<FuncOp>(op, ctx).is_some()
     }
@@ -315,8 +293,9 @@ impl MatchRewrite for TensorToMemref {
     fn rewrite(
         &mut self,
         ctx: &mut Context,
-        rewriter: &mut MatchRewriter,
+        rewriter: &mut DialectConversionRewriter,
         op: Ptr<Operation>,
+        _operand_info: &[OperandConversionInfo],
     ) -> Result<()> {
         if let Some(func_op) = Operation::get_op::<FuncOp>(op, ctx) {
             return lower_func_op_to_llvm(&func_op, ctx);
