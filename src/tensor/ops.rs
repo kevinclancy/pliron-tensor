@@ -43,7 +43,7 @@ use crate::memref::{
     type_interfaces::{MultiDimensionalType, ShapedType},
 };
 
-use super::{op_interfaces::BinaryTensorOpInterface, types::RankedTensorType};
+use super::{op_interfaces::ElementWiseBinaryTensorOpInterface, types::RankedTensorType};
 
 /// Op to generate a tensor by applying a function to generate the value at each index.
 /// See MLIR's [GenerateOp](https://mlir.llvm.org/docs/Dialects/TensorOps/#tensorgenerate-tensorgenerateop).
@@ -349,7 +349,7 @@ impl Verify for ExtractOp {
     format = "operands(CharSpace(`,`)) ` : ` type($0)",
     interfaces = [
         OneResultInterface,
-        BinaryTensorOpInterface,
+        ElementWiseBinaryTensorOpInterface,
         NResultsInterface<1>,
         NOpdsInterface<2>,
         AllResultsOfType<RankedTensorType>,
@@ -362,6 +362,135 @@ pub struct AddOp;
 
 impl AddOp {
     /// Create a new AddOp with the given operands and result type.
+    pub fn new(ctx: &mut Context, lhs: Value, rhs: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![lhs.get_type(ctx)],
+            vec![lhs, rhs],
+            vec![],
+            0,
+        );
+        Self { op }
+    }
+}
+
+/// Subtract two tensors.
+///
+/// ## Operand(s)
+/// | operand | description |
+/// |-----|-------|
+/// | `lhs` | The left-hand side tensor. |
+/// | `rhs` | The right-hand side tensor. |
+///
+/// ## Result(s)
+/// | result | description |
+/// |-----|-------|
+/// | `result` | The resulting tensor, with same shape as the operands. |
+#[pliron_op(
+    name = "tensor.sub",
+    format = "operands(CharSpace(`,`)) ` : ` type($0)",
+    interfaces = [
+        OneResultInterface,
+        ElementWiseBinaryTensorOpInterface,
+        NResultsInterface<1>,
+        NOpdsInterface<2>,
+        AllResultsOfType<RankedTensorType>,
+        AllOperandsOfType<RankedTensorType>,
+        CompatibleShapesOp<RankedTensorType>,
+    ],
+    verifier = "succ"
+)]
+pub struct SubOp;
+
+impl SubOp {
+    /// Create a new SubOp with the given operands and result type.
+    pub fn new(ctx: &mut Context, lhs: Value, rhs: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![lhs.get_type(ctx)],
+            vec![lhs, rhs],
+            vec![],
+            0,
+        );
+        Self { op }
+    }
+}
+
+/// Multiply two tensors.
+///
+/// ## Operand(s)
+/// | operand | description |
+/// |-----|-------|
+/// | `lhs` | The left-hand side tensor. |
+/// | `rhs` | The right-hand side tensor. |
+///
+/// ## Result(s)
+/// | result | description |
+/// |-----|-------|
+/// | `result` | The resulting tensor, with same shape as the operands. |
+#[pliron_op(
+    name = "tensor.mul",
+    format = "operands(CharSpace(`,`)) ` : ` type($0)",
+    interfaces = [
+        OneResultInterface,
+        ElementWiseBinaryTensorOpInterface,
+        NResultsInterface<1>,
+        NOpdsInterface<2>,
+        AllResultsOfType<RankedTensorType>,
+        AllOperandsOfType<RankedTensorType>,
+        CompatibleShapesOp<RankedTensorType>,
+    ],
+    verifier = "succ"
+)]
+pub struct MulOp;
+
+impl MulOp {
+    /// Create a new MulOp with the given operands and result type.
+    pub fn new(ctx: &mut Context, lhs: Value, rhs: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![lhs.get_type(ctx)],
+            vec![lhs, rhs],
+            vec![],
+            0,
+        );
+        Self { op }
+    }
+}
+
+/// Divide two tensors.
+///
+/// ## Operand(s)
+/// | operand | description |
+/// |-----|-------|
+/// | `lhs` | The left-hand side tensor. |
+/// | `rhs` | The right-hand side tensor. |
+///
+/// ## Result(s)
+/// | result | description |
+/// |-----|-------|
+/// | `result` | The resulting tensor, with same shape as the operands. |
+#[pliron_op(
+    name = "tensor.div",
+    format = "operands(CharSpace(`,`)) ` : ` type($0)",
+    interfaces = [
+        OneResultInterface,
+        ElementWiseBinaryTensorOpInterface,
+        NResultsInterface<1>,
+        NOpdsInterface<2>,
+        AllResultsOfType<RankedTensorType>,
+        AllOperandsOfType<RankedTensorType>,
+        CompatibleShapesOp<RankedTensorType>,
+    ],
+    verifier = "succ"
+)]
+pub struct DivOp;
+
+impl DivOp {
+    /// Create a new DivOp with the given operands and result type.
     pub fn new(ctx: &mut Context, lhs: Value, rhs: Value) -> Self {
         let op = Operation::new(
             ctx,

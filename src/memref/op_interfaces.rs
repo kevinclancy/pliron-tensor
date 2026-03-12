@@ -176,17 +176,17 @@ pub trait CompatibleShapesOp<T: ShapedType>: AllResultsOfType<T> + AllOperandsOf
     }
 }
 
-/// Interface for binary arithmetic memref ops (e.g., AddOp).
+/// Interface for element-wise binary arithmetic memref ops (e.g., AddOp).
 /// These ops must have exactly 3 operands, with the first operand
 /// being the result and the next two operands being the inputs.
 #[op_interface]
-pub trait BinaryMemrefOpInterface:
+pub trait ElementWiseBinaryMemrefOpInterface:
     NResultsInterface<0>
     + AllOperandsOfType<RankedMemrefType>
     + NOpdsInterface<3>
     + CompatibleShapesOp<RankedMemrefType>
 {
-    /// Create a new instance of the binary memref op with the specified operands.
+    /// Create a new instance of the element-wise binary memref op with the specified operands.
     fn new(ctx: &mut Context, res: Value, lhs: Value, rhs: Value) -> Self
     where
         Self: Sized,
@@ -200,7 +200,7 @@ pub trait BinaryMemrefOpInterface:
             0,
         );
         Operation::get_op(op, ctx)
-            .expect("Failed to create binary memref op with specified operands")
+            .expect("Failed to create element-wise binary memref op with specified operands")
     }
 
     /// Get the result memref operand.

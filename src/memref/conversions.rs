@@ -7,7 +7,7 @@ use pliron::{
             CallOpCallable, OneRegionInterface, OneResultInterface, SymbolOpInterface,
         },
         type_interfaces::{FloatTypeInterface, FunctionTypeInterface},
-        types::Signedness,
+        types::{IntegerType, Signedness},
     },
     context::{Context, Ptr},
     derive::{op_interface_impl, type_interface_impl},
@@ -35,14 +35,16 @@ use pliron_llvm::{
     ToLLVMType, ToLLVMTypeFn,
     attributes::{FastmathFlagsAttr, IntegerOverflowFlagsAttr},
     function_call_utils::{compute_type_size_in_bytes, lookup_or_create_malloc_fn},
-    op_interfaces::{FloatBinArithOpWithFastMathFlags, IntBinArithOpWithOverflowFlag},
+    op_interfaces::{BinArithOp, FloatBinArithOpWithFastMathFlags, IntBinArithOpWithOverflowFlag},
     ops::{BrOp, CallOp, FuncOp, MulOp},
 };
 
 use crate::memref::{
     descriptor,
-    op_interfaces::BinaryMemrefOpInterface,
-    ops::{AddOp, AllocOp, GenerateOp, LoadOp, StoreOp, YieldOp},
+    op_interfaces::ElementWiseBinaryMemrefOpInterface,
+    ops::{
+        AddOp, AllocOp, DivOp, GenerateOp, LoadOp, MulOp as MemrefMulOp, StoreOp, SubOp, YieldOp,
+    },
     type_interfaces::{MultiDimensionalType, ShapedType},
     types::RankedMemrefType,
 };
@@ -270,7 +272,7 @@ impl ToCFDialect for LoadOp {
     }
 }
 
-trait BinaryMemrefOpToCF: BinaryMemrefOpInterface {
+trait ElementWiseBinaryMemrefOpToCF: ElementWiseBinaryMemrefOpInterface {
     fn rewrite(
         &self,
         ctx: &mut Context,
@@ -364,7 +366,7 @@ trait BinaryMemrefOpToCF: BinaryMemrefOpInterface {
     fn build_llvm_op(&self) -> fn(&mut Context, Value, Value, Ptr<TypeObj>) -> Ptr<Operation>;
 }
 
-impl BinaryMemrefOpToCF for AddOp {
+impl ElementWiseBinaryMemrefOpToCF for AddOp {
     fn build_llvm_op(
         &self,
     ) -> fn(&mut Context, Value, Value, elem_ty: Ptr<TypeObj>) -> Ptr<Operation> {
@@ -398,7 +400,129 @@ impl ToCFDialect for AddOp {
         rewriter: &mut DialectConversionRewriter,
         operand_info: &[OperandConversionInfo],
     ) -> Result<()> {
-        <Self as BinaryMemrefOpToCF>::rewrite(self, ctx, rewriter, operand_info)
+        <Self as ElementWiseBinaryMemrefOpToCF>::rewrite(self, ctx, rewriter, operand_info)
+    }
+}
+
+impl ElementWiseBinaryMemrefOpToCF for SubOp {
+    fn build_llvm_op(
+        &self,
+    ) -> fn(&mut Context, Value, Value, elem_ty: Ptr<TypeObj>) -> Ptr<Operation> {
+        |ctx, lhs, rhs, elem_ty| {
+            if type_impls::<dyn FloatTypeInterface>(&**elem_ty.deref(ctx)) {
+                pliron_llvm::ops::FSubOp::new_with_fast_math_flags(
+                    ctx,
+                    lhs,
+                    rhs,
+                    FastmathFlagsAttr::default(),
+                )
+                .get_operation()
+            } else {
+                pliron_llvm::ops::SubOp::new_with_overflow_flag(
+                    ctx,
+                    lhs,
+                    rhs,
+                    IntegerOverflowFlagsAttr::default(),
+                )
+                .get_operation()
+            }
+        }
+    }
+}
+
+#[op_interface_impl]
+impl ToCFDialect for SubOp {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operand_info: &[OperandConversionInfo],
+    ) -> Result<()> {
+        <Self as ElementWiseBinaryMemrefOpToCF>::rewrite(self, ctx, rewriter, operand_info)
+    }
+}
+
+impl ElementWiseBinaryMemrefOpToCF for MemrefMulOp {
+    fn build_llvm_op(
+        &self,
+    ) -> fn(&mut Context, Value, Value, elem_ty: Ptr<TypeObj>) -> Ptr<Operation> {
+        |ctx, lhs, rhs, elem_ty| {
+            if type_impls::<dyn FloatTypeInterface>(&**elem_ty.deref(ctx)) {
+                pliron_llvm::ops::FMulOp::new_with_fast_math_flags(
+                    ctx,
+                    lhs,
+                    rhs,
+                    FastmathFlagsAttr::default(),
+                )
+                .get_operation()
+            } else {
+                pliron_llvm::ops::MulOp::new_with_overflow_flag(
+                    ctx,
+                    lhs,
+                    rhs,
+                    IntegerOverflowFlagsAttr::default(),
+                )
+                .get_operation()
+            }
+        }
+    }
+}
+
+#[op_interface_impl]
+impl ToCFDialect for MemrefMulOp {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operand_info: &[OperandConversionInfo],
+    ) -> Result<()> {
+        <Self as ElementWiseBinaryMemrefOpToCF>::rewrite(self, ctx, rewriter, operand_info)
+    }
+}
+
+impl ElementWiseBinaryMemrefOpToCF for DivOp {
+    fn build_llvm_op(
+        &self,
+    ) -> fn(&mut Context, Value, Value, elem_ty: Ptr<TypeObj>) -> Ptr<Operation> {
+        |ctx, lhs, rhs, elem_ty| {
+            if type_impls::<dyn FloatTypeInterface>(&**elem_ty.deref(ctx)) {
+                pliron_llvm::ops::FDivOp::new_with_fast_math_flags(
+                    ctx,
+                    lhs,
+                    rhs,
+                    FastmathFlagsAttr::default(),
+                )
+                .get_operation()
+            } else {
+                let signedness = {
+                    let elem_ty_ref = elem_ty.deref(ctx);
+                    elem_ty_ref
+                        .downcast_ref::<IntegerType>()
+                        .expect("Expected integer element type for integer division")
+                        .signedness()
+                };
+                match signedness {
+                    Signedness::Unsigned => {
+                        pliron_llvm::ops::UDivOp::new(ctx, lhs, rhs).get_operation()
+                    }
+                    Signedness::Signed | Signedness::Signless => {
+                        pliron_llvm::ops::SDivOp::new(ctx, lhs, rhs).get_operation()
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[op_interface_impl]
+impl ToCFDialect for DivOp {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operand_info: &[OperandConversionInfo],
+    ) -> Result<()> {
+        <Self as ElementWiseBinaryMemrefOpToCF>::rewrite(self, ctx, rewriter, operand_info)
     }
 }
 

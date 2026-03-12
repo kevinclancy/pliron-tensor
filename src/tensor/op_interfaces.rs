@@ -16,21 +16,21 @@ use crate::memref::op_interfaces::CompatibleShapesOp;
 
 use super::types::RankedTensorType;
 
-/// Error for binary arithmetic tensor ops verification.
+/// Error for element-wise binary arithmetic tensor ops verification.
 #[derive(thiserror::Error, Debug)]
-pub enum BinArithOpErr {
-    #[error("Binary tensor op must have exactly 2 operands")]
+pub enum ElementWiseBinaryTensorOpErr {
+    #[error("Element-wise binary tensor op must have exactly 2 operands")]
     InvalidNumOperands,
-    #[error("Binary tensor op result type must be a RankedTensorType")]
+    #[error("Element-wise binary tensor op result type must be a RankedTensorType")]
     InvalidResult,
 }
 
-/// Interface for binary arithmetic tensor ops (e.g., AddOp).
+/// Interface for element-wise binary arithmetic tensor ops (e.g., AddOp).
 /// These ops must have exactly 2 operands and 1 result,
 /// and the operand and result types must all be the RankedTensorType
 /// with the same rank, shape (for non-dynamic dimensions) and element type.
 #[op_interface]
-pub trait BinaryTensorOpInterface:
+pub trait ElementWiseBinaryTensorOpInterface:
     OneResultInterface
     + NResultsInterface<1>
     + AllResultsOfType<RankedTensorType>

@@ -41,7 +41,7 @@ use pliron_common_dialects::{
 };
 
 use crate::memref::{
-    op_interfaces::{BinaryMemrefOpInterface, CompatibleShapesOp, GenerateOpInterface},
+    op_interfaces::{CompatibleShapesOp, ElementWiseBinaryMemrefOpInterface, GenerateOpInterface},
     type_interfaces::{MultiDimensionalType, ShapedType},
     types::RankedMemrefType,
 };
@@ -595,8 +595,83 @@ impl LoadOp {
         AllOperandsOfType<RankedMemrefType>,
         CompatibleShapesOp<RankedMemrefType>,
         AllResultsOfType<RankedMemrefType>,
-        BinaryMemrefOpInterface,
+        ElementWiseBinaryMemrefOpInterface,
     ],
     verifier = "succ"
 )]
 pub struct AddOp;
+
+/// Subtraction of two memrefs elementwise. The memrefs must have the same shape and element type.
+///
+/// ## Operand(s)
+/// | operand | description |
+/// |-----|-------|
+/// | `res` | The memref where the result will be stored. |
+/// | `lhs` | The first memref value to subtract from. |
+/// | `rhs` | The second memref value to subtract. |
+#[pliron_op(
+    name = "memref.sub",
+    format = "$0 ` <- ` $1 ` - ` $2",
+    interfaces = [
+        NResultsInterface<0>,
+        NOpdsInterface<3>,
+        SameOperandsType,
+        AtLeastNOpdsInterface<1>,
+        AllOperandsOfType<RankedMemrefType>,
+        CompatibleShapesOp<RankedMemrefType>,
+        AllResultsOfType<RankedMemrefType>,
+        ElementWiseBinaryMemrefOpInterface,
+    ],
+    verifier = "succ"
+)]
+pub struct SubOp;
+
+/// Multiplication of two memrefs elementwise. The memrefs must have the same shape and element type.
+///
+/// ## Operand(s)
+/// | operand | description |
+/// |-----|-------|
+/// | `res` | The memref where the result will be stored. |
+/// | `lhs` | The first memref value to multiply. |
+/// | `rhs` | The second memref value to multiply. |
+#[pliron_op(
+    name = "memref.mul",
+    format = "$0 ` <- ` $1 ` * ` $2",
+    interfaces = [
+        NResultsInterface<0>,
+        NOpdsInterface<3>,
+        SameOperandsType,
+        AtLeastNOpdsInterface<1>,
+        AllOperandsOfType<RankedMemrefType>,
+        CompatibleShapesOp<RankedMemrefType>,
+        AllResultsOfType<RankedMemrefType>,
+        ElementWiseBinaryMemrefOpInterface,
+    ],
+    verifier = "succ"
+)]
+pub struct MulOp;
+
+/// Division of two memrefs elementwise. The memrefs must have the same shape and element type.
+///
+/// ## Operand(s)
+/// | operand | description |
+/// |-----|-------|
+/// | `res` | The memref where the result will be stored. |
+/// | `lhs` | The dividend memref. |
+/// | `rhs` | The divisor memref. |
+#[pliron_op(
+    name = "memref.div",
+    format = "$0 ` <- ` $1 ` / ` $2",
+    interfaces = [
+        NResultsInterface<0>,
+        NOpdsInterface<3>,
+        SameOperandsType,
+        AtLeastNOpdsInterface<1>,
+        AllOperandsOfType<RankedMemrefType>,
+        CompatibleShapesOp<RankedMemrefType>,
+        AllResultsOfType<RankedMemrefType>,
+        ElementWiseBinaryMemrefOpInterface,
+    ],
+    verifier = "succ"
+)]
+pub struct DivOp;

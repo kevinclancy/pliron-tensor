@@ -27,14 +27,14 @@ use pliron_llvm::ops::FuncOp;
 use crate::{
     memref::{
         self, ToMemrefDialect, ToMemrefType, ToMemrefTypeFn, descriptor,
-        op_interfaces::BinaryMemrefOpInterface,
+        op_interfaces::ElementWiseBinaryMemrefOpInterface,
         ops::{AllocOp, YieldOp},
         type_interfaces::{Dimension, MultiDimensionalType, ShapedType},
         types::RankedMemrefType,
     },
     tensor::{
-        op_interfaces::BinaryTensorOpInterface,
-        ops::{AddOp, ExtractOp, GenerateOp},
+        op_interfaces::ElementWiseBinaryTensorOpInterface,
+        ops::{AddOp, DivOp, ExtractOp, GenerateOp, MulOp, SubOp},
         types::RankedTensorType,
     },
 };
@@ -147,7 +147,7 @@ impl ToMemrefDialect for ExtractOp {
     }
 }
 
-trait BinaryTensorOpToMemref: BinaryTensorOpInterface {
+trait ElementWiseBinaryTensorOpToMemref: ElementWiseBinaryTensorOpInterface {
     fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
         let lhs = self.get_operation().deref(ctx).get_operand(0);
         let rhs = self.get_operation().deref(ctx).get_operand(1);
@@ -198,7 +198,7 @@ trait BinaryTensorOpToMemref: BinaryTensorOpInterface {
     ) -> Ptr<Operation>;
 }
 
-impl BinaryTensorOpToMemref for AddOp {
+impl ElementWiseBinaryTensorOpToMemref for AddOp {
     fn build_memref_op(
         &self,
         ctx: &mut Context,
@@ -210,10 +210,67 @@ impl BinaryTensorOpToMemref for AddOp {
     }
 }
 
+impl ElementWiseBinaryTensorOpToMemref for SubOp {
+    fn build_memref_op(
+        &self,
+        ctx: &mut Context,
+        res: Value,
+        lhs: Value,
+        rhs: Value,
+    ) -> Ptr<Operation> {
+        memref::ops::SubOp::new(ctx, res, lhs, rhs).get_operation()
+    }
+}
+
+impl ElementWiseBinaryTensorOpToMemref for MulOp {
+    fn build_memref_op(
+        &self,
+        ctx: &mut Context,
+        res: Value,
+        lhs: Value,
+        rhs: Value,
+    ) -> Ptr<Operation> {
+        memref::ops::MulOp::new(ctx, res, lhs, rhs).get_operation()
+    }
+}
+
+impl ElementWiseBinaryTensorOpToMemref for DivOp {
+    fn build_memref_op(
+        &self,
+        ctx: &mut Context,
+        res: Value,
+        lhs: Value,
+        rhs: Value,
+    ) -> Ptr<Operation> {
+        memref::ops::DivOp::new(ctx, res, lhs, rhs).get_operation()
+    }
+}
+
 #[op_interface_impl]
 impl ToMemrefDialect for AddOp {
     fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
-        <Self as BinaryTensorOpToMemref>::rewrite(self, ctx, rewriter)
+        <Self as ElementWiseBinaryTensorOpToMemref>::rewrite(self, ctx, rewriter)
+    }
+}
+
+#[op_interface_impl]
+impl ToMemrefDialect for SubOp {
+    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
+        <Self as ElementWiseBinaryTensorOpToMemref>::rewrite(self, ctx, rewriter)
+    }
+}
+
+#[op_interface_impl]
+impl ToMemrefDialect for MulOp {
+    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
+        <Self as ElementWiseBinaryTensorOpToMemref>::rewrite(self, ctx, rewriter)
+    }
+}
+
+#[op_interface_impl]
+impl ToMemrefDialect for DivOp {
+    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
+        <Self as ElementWiseBinaryTensorOpToMemref>::rewrite(self, ctx, rewriter)
     }
 }
 
