@@ -675,3 +675,149 @@ pub struct MulOp;
     verifier = "succ"
 )]
 pub struct DivOp;
+
+/// Matrix multiplication op for memrefs.
+/// Computes `res[i,j] = sum_k(lhs[i,k] * rhs[k,j])`.
+/// `res` has shape [M, N], `lhs` has shape [M, K], `rhs` has shape [K, N].
+///
+/// ## Operand(s)
+/// | operand | description |
+/// |-----|-------|
+/// | `res` | Destination memref of shape [M, N]; result is written here. |
+/// | `lhs` | Left-hand side memref of shape [M, K]. |
+/// | `rhs` | Right-hand side memref of shape [K, N]. |
+#[pliron_op(
+    name = "memref.matmul",
+    format = "$0 ` <- ` $1 ` X ` $2",
+    interfaces = [
+        NResultsInterface<0>,
+        NOpdsInterface<3>,
+        AllOperandsOfType<RankedMemrefType>,
+    ],
+)]
+pub struct MatMulOp;
+
+#[derive(Debug, thiserror::Error)]
+pub enum MatMulOpVerifyErr {
+    #[error("MatMulOp operands must be 2D ranked memrefs")]
+    OperandNot2DMemref,
+    #[error("MatMulOp operands must all have the same element type")]
+    ElementTypeMismatch,
+    #[error("MatMulOp lhs inner dim K ({lhs_k}) must match rhs outer dim K ({rhs_k})")]
+    InnerDimMismatch { lhs_k: usize, rhs_k: usize },
+    #[error("MatMulOp result dim {dim} (={result_d}) must match expected {expected}")]
+    ResultDimMismatch {
+        dim: usize,
+        result_d: usize,
+        expected: usize,
+    },
+}
+
+impl Verify for MatMulOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        use crate::memref::type_interfaces::Dimension;
+        let loc = self.loc(ctx);
+        let res = self.get_result_memref(ctx);
+        let lhs = self.get_lhs_memref(ctx);
+        let rhs = self.get_rhs_memref(ctx);
+
+        let res_ty_ref = res.get_type(ctx);
+        let res_binding = res_ty_ref.deref(ctx);
+        let res_ty = res_binding
+            .downcast_ref::<RankedMemrefType>()
+            .ok_or_else(|| verify_error!(loc.clone(), MatMulOpVerifyErr::OperandNot2DMemref))?;
+        let lhs_ty_ref = lhs.get_type(ctx);
+        let lhs_binding = lhs_ty_ref.deref(ctx);
+        let lhs_ty = lhs_binding
+            .downcast_ref::<RankedMemrefType>()
+            .ok_or_else(|| verify_error!(loc.clone(), MatMulOpVerifyErr::OperandNot2DMemref))?;
+        let rhs_ty_ref = rhs.get_type(ctx);
+        let rhs_binding = rhs_ty_ref.deref(ctx);
+        let rhs_ty = rhs_binding
+            .downcast_ref::<RankedMemrefType>()
+            .ok_or_else(|| verify_error!(loc.clone(), MatMulOpVerifyErr::OperandNot2DMemref))?;
+
+        if res_ty.rank() != 2 || lhs_ty.rank() != 2 || rhs_ty.rank() != 2 {
+            return verify_err!(loc, MatMulOpVerifyErr::OperandNot2DMemref);
+        }
+
+        let elem_ty = lhs_ty.element_type();
+        if rhs_ty.element_type() != elem_ty || res_ty.element_type() != elem_ty {
+            return verify_err!(loc, MatMulOpVerifyErr::ElementTypeMismatch);
+        }
+
+        let res_shape = res_ty.shape();
+        let lhs_shape = lhs_ty.shape();
+        let rhs_shape = rhs_ty.shape();
+
+        // K: lhs[1] must match rhs[0]
+        if let (Dimension::Static(lhs_k), Dimension::Static(rhs_k)) = (&lhs_shape[1], &rhs_shape[0])
+            && lhs_k != rhs_k
+        {
+            return verify_err!(
+                loc,
+                MatMulOpVerifyErr::InnerDimMismatch {
+                    lhs_k: *lhs_k,
+                    rhs_k: *rhs_k
+                }
+            );
+        }
+        // M: lhs[0] must match res[0]
+        if let (Dimension::Static(lhs_m), Dimension::Static(res_m)) = (&lhs_shape[0], &res_shape[0])
+            && lhs_m != res_m
+        {
+            return verify_err!(
+                loc,
+                MatMulOpVerifyErr::ResultDimMismatch {
+                    dim: 0,
+                    result_d: *res_m,
+                    expected: *lhs_m
+                }
+            );
+        }
+        // N: rhs[1] must match res[1]
+        if let (Dimension::Static(rhs_n), Dimension::Static(res_n)) = (&rhs_shape[1], &res_shape[1])
+            && rhs_n != res_n
+        {
+            return verify_err!(
+                loc,
+                MatMulOpVerifyErr::ResultDimMismatch {
+                    dim: 1,
+                    result_d: *res_n,
+                    expected: *rhs_n
+                }
+            );
+        }
+        Ok(())
+    }
+}
+
+impl MatMulOp {
+    /// Create a new [MatMulOp].
+    pub fn new(ctx: &mut Context, res: Value, lhs: Value, rhs: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            vec![res, lhs, rhs],
+            vec![],
+            0,
+        );
+        Self { op }
+    }
+
+    /// Get the destination memref operand.
+    pub fn get_result_memref(&self, ctx: &Context) -> Value {
+        self.get_operation().deref(ctx).get_operand(0)
+    }
+
+    /// Get the left-hand side memref operand.
+    pub fn get_lhs_memref(&self, ctx: &Context) -> Value {
+        self.get_operation().deref(ctx).get_operand(1)
+    }
+
+    /// Get the right-hand side memref operand.
+    pub fn get_rhs_memref(&self, ctx: &Context) -> Value {
+        self.get_operation().deref(ctx).get_operand(2)
+    }
+}

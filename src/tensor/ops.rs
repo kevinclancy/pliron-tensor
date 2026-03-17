@@ -503,3 +503,224 @@ impl DivOp {
         Self { op }
     }
 }
+
+/// Matrix multiplication of two 2D tensors.
+/// `lhs` has shape [M, K], `rhs` has shape [K, N], and the result has shape [M, N].
+///
+/// ## Operand(s)
+/// | operand | description |
+/// |-----|-------|
+/// | `lhs` | Left-hand side 2D tensor of shape [M, K]. |
+/// | `rhs` | Right-hand side 2D tensor of shape [K, N]. |
+///
+/// ## Result(s)
+/// | result | description |
+/// |-----|-------|
+/// | `result` | The product tensor of shape [M, N]. |
+#[pliron_op(
+    name = "tensor.matmul",
+    interfaces = [
+        OneResultInterface,
+        NResultsInterface<1>,
+        NOpdsInterface<2>,
+        AllResultsOfType<RankedTensorType>,
+        AllOperandsOfType<RankedTensorType>,
+    ],
+)]
+pub struct MatMulOp;
+
+impl Printable for MatMulOp {
+    fn fmt(
+        &self,
+        ctx: &Context,
+        _state: &printable::State,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        let lhs = self.get_operation().deref(ctx).get_operand(0);
+        let rhs = self.get_operation().deref(ctx).get_operand(1);
+        write!(
+            f,
+            "{} {}, {} : {}",
+            Self::get_opid_static(),
+            lhs.disp(ctx),
+            rhs.disp(ctx),
+            self.result_type(ctx).disp(ctx)
+        )
+    }
+}
+
+impl Parsable for MatMulOp {
+    type Arg = Vec<(Identifier, Location)>;
+    type Parsed = OpObj;
+
+    fn parse<'a>(
+        state_stream: &mut parsable::StateStream<'a>,
+        results: Self::Arg,
+    ) -> parsable::ParseResult<'a, Self::Parsed> {
+        let lhs = ssa_opd_parser().skip(spaced(char::string(",")));
+        let rhs = ssa_opd_parser();
+        let res_ty = spaced(char::string(":")).with(Ptr::<TypeObj>::parser(()));
+
+        let ((lhs, rhs, res_ty), _) = (lhs, rhs, res_ty)
+            .parse_stream(state_stream)
+            .into_result()?;
+
+        let op = MatMulOp::new_with_result_type(state_stream.state.ctx, lhs, rhs, res_ty);
+        process_parsed_ssa_defs(state_stream, &results, op.get_operation())?;
+        Ok(OpObj::new(op)).into_parse_result()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MatMulOpVerifyErr {
+    #[error("MatMulOp operands must be 2D ranked tensors")]
+    OperandNot2DTensor,
+    #[error("MatMulOp result must be a 2D ranked tensor")]
+    ResultNot2DTensor,
+    #[error("MatMulOp lhs inner dimension K ({lhs_k}) must match rhs outer dimension K ({rhs_k})")]
+    InnerDimMismatch { lhs_k: usize, rhs_k: usize },
+    #[error("MatMulOp result dimension {dim} (={result_d}) does not match expected {expected}")]
+    ResultDimMismatch {
+        dim: usize,
+        result_d: usize,
+        expected: usize,
+    },
+    #[error("MatMulOp operands and result must have the same element type")]
+    ElementTypeMismatch,
+}
+
+impl Verify for MatMulOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        use crate::memref::type_interfaces::Dimension;
+        let loc = self.loc(ctx);
+        let op_ref = self.get_operation().deref(ctx);
+        let lhs = op_ref.get_operand(0);
+        let rhs = op_ref.get_operand(1);
+        let result = op_ref.get_result(0);
+
+        let lhs_ty_deref = lhs.get_type(ctx);
+        let rhs_ty_deref = rhs.get_type(ctx);
+        let result_ty_deref = result.get_type(ctx);
+
+        let lhs_binding = lhs_ty_deref.deref(ctx);
+        let lhs_ty = lhs_binding
+            .downcast_ref::<RankedTensorType>()
+            .ok_or_else(|| verify_error!(loc.clone(), MatMulOpVerifyErr::OperandNot2DTensor))?;
+        let rhs_binding = rhs_ty_deref.deref(ctx);
+        let rhs_ty = rhs_binding
+            .downcast_ref::<RankedTensorType>()
+            .ok_or_else(|| verify_error!(loc.clone(), MatMulOpVerifyErr::OperandNot2DTensor))?;
+        let result_binding = result_ty_deref.deref(ctx);
+        let result_ty = result_binding
+            .downcast_ref::<RankedTensorType>()
+            .ok_or_else(|| verify_error!(loc.clone(), MatMulOpVerifyErr::ResultNot2DTensor))?;
+
+        if lhs_ty.rank() != 2 {
+            return verify_err!(loc, MatMulOpVerifyErr::OperandNot2DTensor);
+        }
+        if rhs_ty.rank() != 2 {
+            return verify_err!(loc, MatMulOpVerifyErr::OperandNot2DTensor);
+        }
+        if result_ty.rank() != 2 {
+            return verify_err!(loc, MatMulOpVerifyErr::ResultNot2DTensor);
+        }
+
+        let elem_ty = lhs_ty.element_type();
+        if rhs_ty.element_type() != elem_ty || result_ty.element_type() != elem_ty {
+            return verify_err!(loc, MatMulOpVerifyErr::ElementTypeMismatch);
+        }
+
+        let lhs_shape = lhs_ty.shape();
+        let rhs_shape = rhs_ty.shape();
+        let result_shape = result_ty.shape();
+
+        // K: lhs[1] must match rhs[0]
+        if let (Dimension::Static(lhs_k), Dimension::Static(rhs_k)) = (&lhs_shape[1], &rhs_shape[0])
+            && lhs_k != rhs_k
+        {
+            return verify_err!(
+                loc,
+                MatMulOpVerifyErr::InnerDimMismatch {
+                    lhs_k: *lhs_k,
+                    rhs_k: *rhs_k
+                }
+            );
+        }
+        // M: lhs[0] must match result[0]
+        if let (Dimension::Static(lhs_m), Dimension::Static(result_m)) =
+            (&lhs_shape[0], &result_shape[0])
+            && lhs_m != result_m
+        {
+            return verify_err!(
+                loc,
+                MatMulOpVerifyErr::ResultDimMismatch {
+                    dim: 0,
+                    result_d: *result_m,
+                    expected: *lhs_m
+                }
+            );
+        }
+        // N: rhs[1] must match result[1]
+        if let (Dimension::Static(rhs_n), Dimension::Static(result_n)) =
+            (&rhs_shape[1], &result_shape[1])
+            && rhs_n != result_n
+        {
+            return verify_err!(
+                loc,
+                MatMulOpVerifyErr::ResultDimMismatch {
+                    dim: 1,
+                    result_d: *result_n,
+                    expected: *rhs_n
+                }
+            );
+        }
+
+        Ok(())
+    }
+}
+
+impl MatMulOp {
+    /// Create a new [MatMulOp], inferring the result type from the input shapes.
+    /// The result has shape [M, N] where `lhs` has shape [M, K] and `rhs` has shape [K, N].
+    pub fn new(ctx: &mut Context, lhs: Value, rhs: Value) -> Self {
+        use crate::memref::type_interfaces::Dimension;
+        let result_ty = {
+            let lhs_ty = lhs.get_type(ctx);
+            let rhs_ty = rhs.get_type(ctx);
+            let (elem_ty, m, n) = {
+                let lhs_ty_ref = lhs_ty.deref(ctx);
+                let rhs_ty_ref = rhs_ty.deref(ctx);
+                let lhs_ranked = lhs_ty_ref
+                    .downcast_ref::<RankedTensorType>()
+                    .expect("MatMulOp lhs must be a RankedTensorType");
+                let rhs_ranked = rhs_ty_ref
+                    .downcast_ref::<RankedTensorType>()
+                    .expect("MatMulOp rhs must be a RankedTensorType");
+                let elem_ty = lhs_ranked.element_type();
+                let m: Dimension = lhs_ranked.shape()[0].clone();
+                let n: Dimension = rhs_ranked.shape()[1].clone();
+                (elem_ty, m, n)
+            };
+            RankedTensorType::get(ctx, elem_ty, vec![m, n])
+        };
+        Self::new_with_result_type(ctx, lhs, rhs, result_ty.into())
+    }
+
+    /// Create a new [MatMulOp] with an explicitly provided result type.
+    pub fn new_with_result_type(
+        ctx: &mut Context,
+        lhs: Value,
+        rhs: Value,
+        res_ty: Ptr<TypeObj>,
+    ) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![res_ty],
+            vec![lhs, rhs],
+            vec![],
+            0,
+        );
+        Self { op }
+    }
+}

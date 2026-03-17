@@ -43,7 +43,8 @@ use crate::memref::{
     descriptor,
     op_interfaces::ElementWiseBinaryMemrefOpInterface,
     ops::{
-        AddOp, AllocOp, DivOp, GenerateOp, LoadOp, MulOp as MemrefMulOp, StoreOp, SubOp, YieldOp,
+        AddOp, AllocOp, DivOp, GenerateOp, LoadOp, MatMulOp as MemrefMatMulOp,
+        MulOp as MemrefMulOp, StoreOp, SubOp, YieldOp,
     },
     type_interfaces::{MultiDimensionalType, ShapedType},
     types::RankedMemrefType,
@@ -523,6 +524,203 @@ impl ToCFDialect for DivOp {
         operand_info: &[OperandConversionInfo],
     ) -> Result<()> {
         <Self as ElementWiseBinaryMemrefOpToCF>::rewrite(self, ctx, rewriter, operand_info)
+    }
+}
+
+// Lowering for memref::MatMulOp -> two nested NDForOps:
+//   1. Zero-initialise the result memref with a 2D NDForOp over (i, j).
+//   2. Accumulate with a 3D NDForOp over (i, j, k):
+//      res[i,j] += lhs[i,k] * rhs[k,j]
+#[op_interface_impl]
+impl ToCFDialect for MemrefMatMulOp {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operand_info: &[OperandConversionInfo],
+    ) -> Result<()> {
+        let memref_res = self.get_result_memref(ctx);
+        let memref_lhs = self.get_lhs_memref(ctx);
+        let memref_rhs = self.get_rhs_memref(ctx);
+
+        // Recover the element type from before the memref descriptor conversion.
+        let element_ty = {
+            let tys = &operand_info
+                .iter()
+                .find(|info| info.operand == memref_res)
+                .expect("Expected to find operand info for the result memref")
+                .previous_types;
+            tys.iter()
+                .rev()
+                .find_map(|ty| {
+                    let ty_ref = ty.deref(ctx);
+                    ty_ref
+                        .downcast_ref::<RankedMemrefType>()
+                        .map(|t| t.element_type())
+                })
+                .expect("Expected a RankedMemrefType in the previous types of the result memref")
+        };
+
+        // Unpack loop bounds: M, N from res sizes; K from lhs dim 1.
+        let res_sizes = descriptor::unpack_sizes(ctx, rewriter, memref_res);
+        let m_size = res_sizes[0];
+        let n_size = res_sizes[1];
+
+        let lhs_sizes = descriptor::unpack_sizes(ctx, rewriter, memref_lhs);
+        let k_size = lhs_sizes[1];
+
+        let const_0 = IndexConstantOp::new(ctx, 0);
+        let const_1 = IndexConstantOp::new(ctx, 1);
+        rewriter.append_op(ctx, const_0);
+        rewriter.append_op(ctx, const_1);
+        let lb0 = const_0.get_result(ctx);
+        let step1 = const_1.get_result(ctx);
+
+        // Create a zero value of the element type to initialise the output.
+        let zero_op = pliron_llvm::ops::ZeroOp::new(ctx, element_ty);
+        rewriter.append_op(ctx, zero_op);
+        let zero_val = zero_op.get_result(ctx);
+
+        // --- Phase 1: zero-fill res[i,j] for all (i,j) ---
+        let ndfor_zero = {
+            let scoped_rewriter = ScopedRewriter::new(rewriter, OpInsertionPoint::Unset);
+            struct ZeroState<'a> {
+                rewriter: ScopedRewriter<'a, Recorder, IRRewriter<Recorder>>,
+                memref_res: Value,
+                zero_val: Value,
+            }
+            let mut state = ZeroState {
+                rewriter: scoped_rewriter,
+                memref_res,
+                zero_val,
+            };
+            NDForOp::new(
+                ctx,
+                vec![lb0, lb0],
+                vec![m_size, n_size],
+                vec![step1, step1],
+                |ctx, state, inserter, indices| {
+                    let rewriter = &mut state.rewriter;
+                    rewriter.set_insertion_point(inserter.get_insertion_point());
+                    let store = StoreOp::new(ctx, state.zero_val, state.memref_res, indices);
+                    rewriter.append_op(ctx, store);
+                },
+                &mut state,
+            )
+        };
+        rewriter.append_op(ctx, ndfor_zero);
+
+        // --- Phase 2: accumulate res[i,j] += lhs[i,k] * rhs[k,j] ---
+        let ndfor_accum = {
+            let scoped_rewriter = ScopedRewriter::new(rewriter, OpInsertionPoint::Unset);
+            struct AccumState<'a> {
+                rewriter: ScopedRewriter<'a, Recorder, IRRewriter<Recorder>>,
+                memref_res: Value,
+                memref_lhs: Value,
+                memref_rhs: Value,
+                elem_ty: Ptr<TypeObj>,
+                mul_fn: fn(&mut Context, Value, Value, Ptr<TypeObj>) -> Ptr<Operation>,
+                add_fn: fn(&mut Context, Value, Value, Ptr<TypeObj>) -> Ptr<Operation>,
+            }
+            let mul_fn: fn(&mut Context, Value, Value, Ptr<TypeObj>) -> Ptr<Operation> =
+                |ctx, a, b, elem_ty| {
+                    if type_impls::<dyn FloatTypeInterface>(&**elem_ty.deref(ctx)) {
+                        pliron_llvm::ops::FMulOp::new_with_fast_math_flags(
+                            ctx,
+                            a,
+                            b,
+                            FastmathFlagsAttr::default(),
+                        )
+                        .get_operation()
+                    } else {
+                        pliron_llvm::ops::MulOp::new_with_overflow_flag(
+                            ctx,
+                            a,
+                            b,
+                            IntegerOverflowFlagsAttr::default(),
+                        )
+                        .get_operation()
+                    }
+                };
+            let add_fn: fn(&mut Context, Value, Value, Ptr<TypeObj>) -> Ptr<Operation> =
+                |ctx, a, b, elem_ty| {
+                    if type_impls::<dyn FloatTypeInterface>(&**elem_ty.deref(ctx)) {
+                        pliron_llvm::ops::FAddOp::new_with_fast_math_flags(
+                            ctx,
+                            a,
+                            b,
+                            FastmathFlagsAttr::default(),
+                        )
+                        .get_operation()
+                    } else {
+                        pliron_llvm::ops::AddOp::new_with_overflow_flag(
+                            ctx,
+                            a,
+                            b,
+                            IntegerOverflowFlagsAttr::default(),
+                        )
+                        .get_operation()
+                    }
+                };
+            let mut state = AccumState {
+                rewriter: scoped_rewriter,
+                memref_res,
+                memref_lhs,
+                memref_rhs,
+                elem_ty: element_ty,
+                mul_fn,
+                add_fn,
+            };
+            NDForOp::new(
+                ctx,
+                vec![lb0, lb0, lb0],
+                vec![m_size, n_size, k_size],
+                vec![step1, step1, step1],
+                |ctx, state, inserter, indices| {
+                    let rewriter = &mut state.rewriter;
+                    rewriter.set_insertion_point(inserter.get_insertion_point());
+
+                    let i = indices[0];
+                    let j = indices[1];
+                    let k = indices[2];
+                    let elem_ty = state.elem_ty;
+
+                    // Load accumulator: acc = res[i, j]
+                    let load_acc = LoadOp::new(ctx, elem_ty, state.memref_res, vec![i, j]);
+                    rewriter.append_op(ctx, load_acc);
+                    // Load a = lhs[i, k]
+                    let load_a = LoadOp::new(ctx, elem_ty, state.memref_lhs, vec![i, k]);
+                    rewriter.append_op(ctx, load_a);
+                    // Load b = rhs[k, j]
+                    let load_b = LoadOp::new(ctx, elem_ty, state.memref_rhs, vec![k, j]);
+                    rewriter.append_op(ctx, load_b);
+
+                    // mul = a * b
+                    let mul = (state.mul_fn)(
+                        ctx,
+                        load_a.get_result(ctx),
+                        load_b.get_result(ctx),
+                        elem_ty,
+                    );
+                    rewriter.append_operation(ctx, mul);
+
+                    // new_acc = acc + mul
+                    let mul_result = mul.deref(ctx).get_result(0);
+                    let load_acc_result = load_acc.get_result(ctx);
+                    let add = (state.add_fn)(ctx, load_acc_result, mul_result, elem_ty);
+                    rewriter.append_operation(ctx, add);
+
+                    // Store res[i, j] = new_acc
+                    let add_result = add.deref(ctx).get_result(0);
+                    let store = StoreOp::new(ctx, add_result, state.memref_res, vec![i, j]);
+                    rewriter.append_op(ctx, store);
+                },
+                &mut state,
+            )
+        };
+        rewriter.append_op(ctx, ndfor_accum);
+        rewriter.replace_operation(ctx, self.get_operation(), ndfor_accum.get_operation());
+        Ok(())
     }
 }
 

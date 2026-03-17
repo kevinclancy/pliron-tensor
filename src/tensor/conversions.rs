@@ -28,13 +28,13 @@ use crate::{
     memref::{
         self, ToMemrefDialect, ToMemrefType, ToMemrefTypeFn, descriptor,
         op_interfaces::ElementWiseBinaryMemrefOpInterface,
-        ops::{AllocOp, YieldOp},
+        ops::{AllocOp, MatMulOp as MemrefMatMulOp, YieldOp},
         type_interfaces::{Dimension, MultiDimensionalType, ShapedType},
         types::RankedMemrefType,
     },
     tensor::{
         op_interfaces::ElementWiseBinaryTensorOpInterface,
-        ops::{AddOp, DivOp, ExtractOp, GenerateOp, MulOp, SubOp},
+        ops::{AddOp, DivOp, ExtractOp, GenerateOp, MatMulOp, MulOp, SubOp},
         types::RankedTensorType,
     },
 };
@@ -286,6 +286,58 @@ impl ToMemrefDialect for pliron_llvm::ops::LoadOp {
             loaded_ty
         };
         self.get_result(ctx).set_type(ctx, memref_ty);
+        Ok(())
+    }
+}
+
+// Lowering for tensor::MatMulOp -> AllocOp + memref::MatMulOp
+#[op_interface_impl]
+impl ToMemrefDialect for MatMulOp {
+    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
+        let lhs = self.get_operation().deref(ctx).get_operand(0);
+        let rhs = self.get_operation().deref(ctx).get_operand(1);
+
+        let result_ty_ptr = self.get_result(ctx).get_type(ctx);
+        let converter = {
+            let result_ty_ref = result_ty_ptr.deref(ctx);
+            let result_ty = result_ty_ref
+                .downcast_ref::<RankedTensorType>()
+                .expect("MatMulOp must have a ranked tensor result");
+            result_ty.converter()
+        };
+        let result_ty = converter(result_ty_ptr, ctx)?;
+        let result_ty = TypePtr::<RankedMemrefType>::from_ptr(result_ty, ctx)
+            .expect("Expected the converted type to be a RankedMemrefType");
+        let elem_ty = result_ty.deref(ctx).element_type();
+
+        // Build the dynamic dimension operands for the result allocation.
+        // Result shape: [M, N] where M = lhs dim 0, N = rhs dim 1.
+        let result_shape = result_ty.deref(ctx).shape().clone();
+        let dynamic_dim_operands = result_shape
+            .iter()
+            .enumerate()
+            .filter_map(|(i, dim)| {
+                if let Dimension::Dynamic = dim {
+                    let val = if i == 0 {
+                        descriptor::unpack_size(ctx, rewriter, lhs, 0)
+                    } else {
+                        descriptor::unpack_size(ctx, rewriter, rhs, 1)
+                    };
+                    Some(val)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let result_memref_ty = RankedMemrefType::get(ctx, elem_ty, result_shape);
+        let alloc = AllocOp::new(ctx, result_memref_ty, dynamic_dim_operands);
+        rewriter.append_op(ctx, alloc);
+
+        let matmul = MemrefMatMulOp::new(ctx, alloc.get_result(ctx), lhs, rhs);
+        rewriter.append_operation(ctx, matmul.get_operation());
+
+        rewriter.replace_operation(ctx, self.get_operation(), alloc.get_operation());
         Ok(())
     }
 }
