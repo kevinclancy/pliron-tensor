@@ -88,7 +88,7 @@ fn test_tensor_to_memref_conversion() {
     log::debug!("LLVM-IR generated:\n{}", llvm_ir);
     llvm_ir
         .verify()
-        .inspect_err(|e| println!("LLVM-IR verification failed: {}", e))
+        .inspect_err(|e| eprintln!("LLVM-IR verification failed: {}", e))
         .unwrap();
 
     // Let's try and execute this function
@@ -157,7 +157,7 @@ fn test_int_tensor_from_rust() {
     log::debug!("LLVM-IR generated:\n{}", llvm_ir);
     llvm_ir
         .verify()
-        .inspect_err(|e| println!("LLVM-IR verification failed: {}", e))
+        .inspect_err(|e| eprintln!("LLVM-IR verification failed: {}", e))
         .unwrap();
 
     // Let's try and execute this function
@@ -301,7 +301,7 @@ fn test_int_tensor_matmul_from_rust(input_ir: &str) {
     log::debug!("LLVM-IR generated:\n{}", llvm_ir);
     llvm_ir
         .verify()
-        .inspect_err(|e| println!("LLVM-IR verification failed: {}", e))
+        .inspect_err(|e| eprintln!("LLVM-IR verification failed: {}", e))
         .unwrap();
 
     initialize_native().expect("Failed to initialize native target for LLVM execution");
@@ -408,7 +408,7 @@ fn test_float_tensor_from_rust() {
     log::debug!("LLVM-IR generated:\n{}", llvm_ir);
     llvm_ir
         .verify()
-        .inspect_err(|e| println!("LLVM-IR verification failed: {}", e))
+        .inspect_err(|e| eprintln!("LLVM-IR verification failed: {}", e))
         .unwrap();
 
     initialize_native().expect("Failed to initialize native target for LLVM execution");
@@ -522,7 +522,7 @@ fn test_float_tensor_all_binary_ops_from_rust() {
     log::debug!("LLVM-IR generated:\n{}", llvm_ir);
     llvm_ir
         .verify()
-        .inspect_err(|e| println!("LLVM-IR verification failed: {}", e))
+        .inspect_err(|e| eprintln!("LLVM-IR verification failed: {}", e))
         .unwrap();
 
     initialize_native().expect("Failed to initialize native target for LLVM execution");
@@ -585,4 +585,52 @@ fn test_float_tensor_all_binary_ops_from_rust() {
         let expected = ((a + b) * b) / a;
         assert!((c - expected).abs() < 1e-12);
     }
+}
+
+/// Test that `tensor.extract_slice` is correctly lowered to `memref.extract_slice`
+/// by the TensorToMemref conversion pass.
+#[test]
+fn test_extract_slice_tensor_to_memref() {
+    init_env_logger();
+    let ctx = &mut Context::new();
+
+    let input_ir = r#"
+                builtin.module @test_module {
+                    ^entry():
+                        llvm.func @test_extract_slice: llvm.func <llvm.void (tensor.ranked<10x20:builtin.integer i64>) variadic = false> [] {
+                            ^entry(src : tensor.ranked<10x20:builtin.integer i64>):
+                                slice = tensor.extract_slice src [0, 2] [5, 10] [1, 2] : tensor.ranked<5x10:builtin.integer i64>;
+                                llvm.return
+                        }
+                }
+        "#;
+
+    let state_stream = state_stream_from_iterator(
+        input_ir.chars(),
+        parsable::State::new(ctx, location::Source::InMemory),
+    );
+    let parsed = spaced(Operation::top_level_parser())
+        .parse(state_stream)
+        .map(|(op, _)| op)
+        .map_err(|err| input_error_noloc!(err));
+    let parsed_op = parsed.expect_ok(ctx);
+    let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    apply_dialect_conversion(ctx, &mut TensorToMemref, parsed_op).expect_ok(ctx);
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    let printed = format!("{}", module_op.disp(ctx));
+    assert!(
+        !printed.contains("tensor.extract_slice"),
+        "tensor.extract_slice should have been lowered"
+    );
+    assert!(
+        printed.contains("memref.extract_slice"),
+        "memref.extract_slice should appear after lowering"
+    );
+    assert!(
+        printed.contains(" <- "),
+        "destination-style memref.extract_slice syntax should be present"
+    );
 }

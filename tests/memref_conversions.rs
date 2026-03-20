@@ -1,5 +1,7 @@
 //! Test conversions of memref operations to CF / LLVM dialect.
 
+pub mod common;
+
 use pliron::{
     builtin::ops::ModuleOp,
     combine::Parser,
@@ -259,6 +261,88 @@ fn test_alloc_generate() {
         for j in 0..16 {
             let result = f(i, j);
             assert_eq!(result, i + j);
+        }
+    }
+}
+
+/// Test that `memref.extract_slice` is correctly lowered to CF / LLVM.
+/// The function allocates a 2×3 source memref, fills it with `src[i][j] = i*3 + j`,
+/// then extracts a 2×2 slice with offsets [0, 1] and steps [1, 1] into a destination
+/// memref, and returns `dst[i_arg][j_arg]`.
+///
+/// Expected: `dst[i][j] = src[i][1 + j] = i*3 + j + 1`.
+#[test]
+fn test_extract_slice() {
+    common::init_env_logger();
+    let ctx = &mut Context::new();
+
+    let input_ir = r#"
+            builtin.module @test_module {
+              ^entry():
+                llvm.func @test_extract_slice: llvm.func <builtin.integer i64 (builtin.integer i64, builtin.integer i64) variadic = false> [] {
+                  ^entry(i_arg: builtin.integer i64, j_arg: builtin.integer i64):
+                    src = memref.alloc : memref.ranked<2 x 3 : builtin.integer i64>;
+                    memref.generate src {
+                      ^entry(i : index.index, j : index.index):
+                        i_int = index.to_integer i to builtin.integer i64;
+                        j_int = index.to_integer j to builtin.integer i64;
+                        three = llvm.constant <builtin.integer <3: i64>> : builtin.integer i64;
+                        row = llvm.mul i_int, three <{nsw = false, nuw = false}> : builtin.integer i64;
+                        val = llvm.add row, j_int <{nsw = false, nuw = false}> : builtin.integer i64;
+                        memref.yield val
+                    };
+                    dst = memref.alloc : memref.ranked<2 x 2 : builtin.integer i64>;
+                    memref.extract_slice dst <- src [0, 1] [2, 2] [1, 1];
+                    i_idx = index.from_integer i_arg : index.index;
+                    j_idx = index.from_integer j_arg : index.index;
+                    result = memref.load dst[i_idx, j_idx]: builtin.integer i64;
+                    llvm.return result
+                }
+            }
+            "#;
+
+    let state_stream = state_stream_from_iterator(
+        input_ir.chars(),
+        parsable::State::new(ctx, location::Source::InMemory),
+    );
+    let parsed = spaced(Operation::top_level_parser())
+        .parse(state_stream)
+        .map(|(op, _)| op)
+        .map_err(|err| input_error_noloc!(err));
+
+    let parsed_op = parsed.expect_ok(ctx);
+    let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
+    log::debug!("parsed module:\n{}", module_op.disp(ctx));
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
+    apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
+    log::debug!("converted module:\n{}", module_op.disp(ctx));
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    let llvm_ctx = LLVMContext::default();
+    let llvm_ir = pliron_llvm::to_llvm_ir::convert_module(ctx, &llvm_ctx, module_op).expect_ok(ctx);
+    llvm_ir
+        .verify()
+        .inspect_err(|e| eprintln!("LLVM-IR verification failed: {}", e))
+        .unwrap();
+    log::debug!("LLVM-IR generated:\n{}", llvm_ir);
+
+    initialize_native().expect("Failed to initialize native target for LLVM execution");
+    let jit = LLVMLLJIT::new_with_default_builder().expect("Failed to create LLJIT");
+    jit.add_module(llvm_ir)
+        .expect("Failed to add module to JIT");
+    let symbol_addr = jit
+        .lookup_symbol("test_extract_slice")
+        .expect("Failed to lookup symbol");
+    assert!(symbol_addr != 0);
+    let f = unsafe { std::mem::transmute::<u64, fn(i64, i64) -> i64>(symbol_addr) };
+
+    // dst[i][j] = src[i][1 + j] = i*3 + (1 + j) = i*3 + j + 1
+    for i in 0..2_i64 {
+        for j in 0..2_i64 {
+            let result = f(i, j);
+            assert_eq!(result, i * 3 + j + 1, "f({i}, {j}) = {result}");
         }
     }
 }

@@ -9,7 +9,7 @@ use pliron::{
         SingleBlockRegionInterface,
     },
     combine::{
-        Parser,
+        Parser, attempt,
         parser::char::{self, spaces},
     },
     common_traits::Verify,
@@ -21,7 +21,9 @@ use pliron::{
         listener::DummyListener,
     },
     irfmt::{
-        parsers::{delimited_list_parser, process_parsed_ssa_defs, spaced, ssa_opd_parser},
+        parsers::{
+            delimited_list_parser, int_parser, process_parsed_ssa_defs, spaced, ssa_opd_parser,
+        },
         printers::iter_with_sep,
     },
     location::Location,
@@ -39,11 +41,15 @@ use pliron_common_dialects::{cf::op_interfaces::YieldingRegion, index::types::In
 
 use crate::memref::{
     op_interfaces::{CompatibleShapesOp, GenerateOpInterface},
-    ops::YieldOp,
+    ops::{SliceParam, YieldOp},
     type_interfaces::{MultiDimensionalType, ShapedType},
 };
 
-use super::{op_interfaces::ElementWiseBinaryTensorOpInterface, types::RankedTensorType};
+use super::{
+    attributes::{SliceParamAttr, SliceParamsAttr},
+    op_interfaces::ElementWiseBinaryTensorOpInterface,
+    types::RankedTensorType,
+};
 
 /// Op to generate a tensor by applying a function to generate the value at each index.
 /// See MLIR's [GenerateOp](https://mlir.llvm.org/docs/Dialects/TensorOps/#tensorgenerate-tensorgenerateop).
@@ -722,5 +728,433 @@ impl MatMulOp {
             0,
         );
         Self { op }
+    }
+}
+
+/// Extract a narrow slice from a tensor.
+///
+/// This operation extracts a contiguous slice from a tensor, specified by
+/// offsets, sizes, and strides per dimension. Each parameter can be static
+/// or dynamic. The result has the same rank as the source tensor.
+///
+/// Similar to (but not the same as) MLIR's
+/// [tensor.extract_slice](https://mlir.llvm.org/docs/Dialects/TensorOps/#tensorextract_slice-tensorextractsliceop)
+///
+/// ### Operand(s)
+/// | operand | description |
+/// |-----|-------|
+/// | `source` | The source tensor to extract from (ranked tensor). |
+/// | `dynamic_offsets` | Zero or more [Index](IndexType) operands for dynamic offsets. |
+/// | `dynamic_sizes` | Zero or more [Index](IndexType) operands for dynamic sizes. |
+/// | `dynamic_steps` | Zero or more [Index](IndexType) operands for dynamic steps. |
+///
+/// ### Result(s)
+/// | result | description |
+/// |-----|-------|
+/// | `result` | The extracted slice, a ranked tensor with the same rank as the source. |
+#[pliron_op(
+    name = "tensor.extract_slice",
+    interfaces = [
+        OneResultInterface,
+        NResultsInterface<1>,
+        AllResultsOfType<RankedTensorType>,
+    ],
+    attributes = (tensor_slice_params: SliceParamsAttr)
+)]
+pub struct ExtractSliceOp;
+
+impl Printable for ExtractSliceOp {
+    fn fmt(
+        &self,
+        ctx: &Context,
+        _state: &printable::State,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        let source = self.source(ctx);
+        write!(f, "{} {}", Self::get_opid_static(), source.disp(ctx))?;
+
+        let print_params =
+            |f: &mut std::fmt::Formatter, params: Vec<SliceParam>| -> std::fmt::Result {
+                write!(f, "[")?;
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    match p {
+                        SliceParam::Static(val) => write!(f, "{}", val)?,
+                        SliceParam::Dynamic(opd) => write!(f, "{}", opd.disp(ctx))?,
+                    }
+                }
+                write!(f, "]")
+            };
+        if let (Some(offsets), Some(sizes), Some(steps)) = (
+            self.slice_offsets(ctx),
+            self.slice_sizes(ctx),
+            self.slice_steps(ctx),
+        ) {
+            print_params(f, offsets)?;
+            print_params(f, sizes)?;
+            print_params(f, steps)?;
+        }
+
+        write!(f, " : {}", self.result_type(ctx).disp(ctx))?;
+
+        Ok(())
+    }
+}
+
+impl Parsable for ExtractSliceOp {
+    type Arg = Vec<(Identifier, Location)>;
+    type Parsed = OpObj;
+
+    fn parse<'a>(
+        state_stream: &mut parsable::StateStream<'a>,
+        results: Self::Arg,
+    ) -> parsable::ParseResult<'a, Self::Parsed> {
+        let slice_param_parser = || {
+            attempt(ssa_opd_parser().map(SliceParam::Dynamic))
+                .or(int_parser::<usize>().map(SliceParam::Static))
+                .boxed()
+        };
+
+        let (source, offsets, sizes, steps, result_ty) = (
+            ssa_opd_parser().skip(spaces()),
+            delimited_list_parser('[', ']', ',', slice_param_parser()).skip(spaces()),
+            delimited_list_parser('[', ']', ',', slice_param_parser()).skip(spaces()),
+            delimited_list_parser('[', ']', ',', slice_param_parser()),
+            spaced(char::string(":")).with(TypePtr::<RankedTensorType>::parser(())),
+        );
+
+        let ((source, offsets, sizes, steps, result_ty), _) =
+            (source, offsets, sizes, steps, result_ty)
+                .parse_stream(state_stream)
+                .into_result()?;
+
+        let op = ExtractSliceOp::new_with_result_type(
+            state_stream.state.ctx,
+            source,
+            offsets,
+            sizes,
+            steps,
+            result_ty,
+        );
+
+        process_parsed_ssa_defs(state_stream, &results, op.get_operation())?;
+        Ok(OpObj::new(op)).into_parse_result()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ExtractSliceOpVerifyErr {
+    #[error("ExtractSliceOp must have at least one operand (the source tensor)")]
+    NoOperands,
+    #[error("The first operand of ExtractSliceOp must be a RankedTensorType")]
+    FirstOperandNotTensor,
+    #[error(
+        "The result type of ExtractSliceOp must be a RankedTensorType with same rank as source"
+    )]
+    ResultTypeMismatch,
+    #[error(
+        "ExtractSliceOp: All dynamic operands must be of IndexType, but operand {index} is {ty}"
+    )]
+    NonIndexOperand { index: usize, ty: String },
+    #[error(
+        "ExtractSliceOp: Number of dynamic operands ({got}) does not match number of dynamic parameters ({expected})"
+    )]
+    NumDynamicOperandsMismatch { expected: usize, got: usize },
+    #[error(
+        "ExtractSliceOp: Number of offsets ({got}) does not match rank of source tensor ({expected})"
+    )]
+    NumOffsetsMismatch { expected: usize, got: usize },
+    #[error(
+        "ExtractSliceOp: Number of sizes ({got}) does not match rank of source tensor ({expected})"
+    )]
+    NumSizesMismatch { expected: usize, got: usize },
+    #[error(
+        "ExtractSliceOp: Number of steps ({got}) does not match rank of source tensor ({expected})"
+    )]
+    NumStepsMismatch { expected: usize, got: usize },
+    #[error("ExtractSliceOp: Missing tensor.slice_params attribute")]
+    MissingSliceParamsAttr,
+    #[error("ExtractSliceOp: Static step values must be non-zero (got 0 at dimension {dim})")]
+    InvalidStaticStep { dim: usize },
+}
+
+impl Verify for ExtractSliceOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+        let op_ref = self.get_operation().deref(ctx);
+        let mut operands = op_ref.operands();
+
+        let Some(source_operand) = operands.next() else {
+            return verify_err!(loc, ExtractSliceOpVerifyErr::NoOperands);
+        };
+
+        let source_ty_ptr = source_operand.get_type(ctx);
+        let source_ty_ref = source_ty_ptr.deref(ctx);
+        let source_ty = source_ty_ref
+            .downcast_ref::<RankedTensorType>()
+            .ok_or_else(|| {
+                verify_error!(loc.clone(), ExtractSliceOpVerifyErr::FirstOperandNotTensor)
+            })?;
+
+        let rank = source_ty.rank();
+
+        // Get result type and verify it's a ranked tensor with same rank as source
+        let result_ty_ptr = self.result_type(ctx);
+        let result_ty_ref = result_ty_ptr.deref(ctx);
+        let result_ty = result_ty_ref
+            .downcast_ref::<RankedTensorType>()
+            .ok_or_else(|| {
+                verify_error!(loc.clone(), ExtractSliceOpVerifyErr::ResultTypeMismatch)
+            })?;
+        if result_ty.rank() != rank {
+            return verify_err!(loc, ExtractSliceOpVerifyErr::ResultTypeMismatch);
+        }
+
+        // Get the slice params attribute
+        let slice_params = self.get_attr_tensor_slice_params(ctx).ok_or_else(|| {
+            verify_error!(loc.clone(), ExtractSliceOpVerifyErr::MissingSliceParamsAttr)
+        })?;
+
+        // Verify that the number of offsets/sizes/steps match the rank
+        if slice_params.offsets.len() != rank {
+            return verify_err!(
+                loc,
+                ExtractSliceOpVerifyErr::NumOffsetsMismatch {
+                    expected: rank,
+                    got: slice_params.offsets.len()
+                }
+            );
+        }
+        if slice_params.sizes.len() != rank {
+            return verify_err!(
+                loc,
+                ExtractSliceOpVerifyErr::NumSizesMismatch {
+                    expected: rank,
+                    got: slice_params.sizes.len()
+                }
+            );
+        }
+        if slice_params.steps.len() != rank {
+            return verify_err!(
+                loc,
+                ExtractSliceOpVerifyErr::NumStepsMismatch {
+                    expected: rank,
+                    got: slice_params.steps.len()
+                }
+            );
+        }
+
+        // Verify all step values are non-zero
+        for (dim, step) in slice_params.steps.iter().enumerate() {
+            if let SliceParamAttr::Static(0) = step {
+                return verify_err!(loc, ExtractSliceOpVerifyErr::InvalidStaticStep { dim });
+            }
+        }
+
+        // Count dynamic parameters
+        let num_dynamic_offsets = slice_params
+            .offsets
+            .iter()
+            .filter(|p| matches!(p, SliceParamAttr::OperandIdx(_)))
+            .count();
+        let num_dynamic_sizes = slice_params
+            .sizes
+            .iter()
+            .filter(|p| matches!(p, SliceParamAttr::OperandIdx(_)))
+            .count();
+        let num_dynamic_steps = slice_params
+            .steps
+            .iter()
+            .filter(|p| matches!(p, SliceParamAttr::OperandIdx(_)))
+            .count();
+
+        let total_dynamic = num_dynamic_offsets + num_dynamic_sizes + num_dynamic_steps;
+        let remaining_operands: Vec<_> = operands.collect();
+
+        // Verify that all remaining operands are Index type
+        for (i, opd) in remaining_operands.iter().enumerate() {
+            let opd_ty = opd.get_type(ctx);
+            let opd_ty_ref = opd_ty.deref(ctx);
+            if !opd_ty_ref.is::<IndexType>() {
+                let ty_name = format!("{:?}", opd_ty_ref);
+                return verify_err!(
+                    loc,
+                    ExtractSliceOpVerifyErr::NonIndexOperand {
+                        index: i + 1,
+                        ty: ty_name
+                    }
+                );
+            }
+        }
+
+        // Verify the count of dynamic operands matches
+        if remaining_operands.len() != total_dynamic {
+            return verify_err!(
+                loc,
+                ExtractSliceOpVerifyErr::NumDynamicOperandsMismatch {
+                    expected: total_dynamic,
+                    got: remaining_operands.len()
+                }
+            );
+        }
+
+        Ok(())
+    }
+}
+
+impl ExtractSliceOp {
+    /// Create a new ExtractSliceOp with the given parameters.
+    ///
+    /// # Arguments
+    /// * `ctx` - The context
+    /// * `source` - The source tensor to slice from
+    /// * `offsets` - The offset for each dimension (static or dynamic)
+    /// * `sizes` - The size for each dimension (static or dynamic)
+    /// * `steps` - The step for each dimension (static or dynamic)
+    ///
+    /// The result type is inferred from the source element type and `sizes`:
+    /// static sizes map to static dimensions, and dynamic sizes map to dynamic dimensions.
+    pub fn new(
+        ctx: &mut Context,
+        source: Value,
+        offsets: Vec<SliceParam>,
+        sizes: Vec<SliceParam>,
+        steps: Vec<SliceParam>,
+    ) -> Self {
+        let source_element_type = {
+            let source_ty_ptr = source.get_type(ctx);
+            let source_ty_ref = source_ty_ptr.deref(ctx);
+            let source_ty = source_ty_ref
+                .downcast_ref::<RankedTensorType>()
+                .expect("ExtractSliceOp source must be a RankedTensorType");
+            source_ty.element_type()
+        };
+
+        let result_shape = sizes
+            .iter()
+            .map(|s| match s {
+                SliceParam::Static(v) => crate::memref::type_interfaces::Dimension::Static(*v),
+                SliceParam::Dynamic(_) => crate::memref::type_interfaces::Dimension::Dynamic,
+            })
+            .collect();
+        let result_type = RankedTensorType::get(ctx, source_element_type, result_shape);
+
+        Self::new_with_result_type(ctx, source, offsets, sizes, steps, result_type)
+    }
+
+    /// Create a new ExtractSliceOp with an explicitly provided result type.
+    ///
+    /// This is useful when constructing from parsed text IR where the result type is
+    /// syntactically present.
+    pub fn new_with_result_type(
+        ctx: &mut Context,
+        source: Value,
+        offsets: Vec<SliceParam>,
+        sizes: Vec<SliceParam>,
+        steps: Vec<SliceParam>,
+        result_type: TypePtr<RankedTensorType>,
+    ) -> Self {
+        let mut operands = vec![source];
+        let mut offset_attrs = Vec::new();
+        let mut size_attrs = Vec::new();
+        let mut step_attrs = Vec::new();
+
+        // Process offsets
+        for offset in offsets {
+            match offset {
+                SliceParam::Static(val) => {
+                    offset_attrs.push(SliceParamAttr::Static(val));
+                }
+                SliceParam::Dynamic(val) => {
+                    offset_attrs.push(SliceParamAttr::OperandIdx(operands.len()));
+                    operands.push(val);
+                }
+            }
+        }
+
+        // Process sizes
+        for size in sizes {
+            match size {
+                SliceParam::Static(val) => {
+                    size_attrs.push(SliceParamAttr::Static(val));
+                }
+                SliceParam::Dynamic(val) => {
+                    size_attrs.push(SliceParamAttr::OperandIdx(operands.len()));
+                    operands.push(val);
+                }
+            }
+        }
+
+        // Process steps
+        for step in steps {
+            match step {
+                SliceParam::Static(val) => {
+                    step_attrs.push(SliceParamAttr::Static(val));
+                }
+                SliceParam::Dynamic(val) => {
+                    step_attrs.push(SliceParamAttr::OperandIdx(operands.len()));
+                    operands.push(val);
+                }
+            }
+        }
+
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_type.into()],
+            operands,
+            vec![],
+            0,
+        );
+
+        let op = Self { op };
+        let slice_params = SliceParamsAttr {
+            offsets: offset_attrs,
+            sizes: size_attrs,
+            steps: step_attrs,
+        };
+        op.set_attr_tensor_slice_params(ctx, slice_params);
+        op
+    }
+
+    /// Get the source tensor operand.
+    pub fn source(&self, ctx: &Context) -> Value {
+        self.get_operation().deref(ctx).get_operand(0)
+    }
+
+    fn slice_attr_to_params(&self, ctx: &Context, attrs: &[SliceParamAttr]) -> Vec<SliceParam> {
+        let op_ref = self.get_operation().deref(ctx);
+        attrs
+            .iter()
+            .map(|a| match a {
+                SliceParamAttr::Static(val) => SliceParam::Static(*val),
+                SliceParamAttr::OperandIdx(idx) => SliceParam::Dynamic(op_ref.get_operand(*idx)),
+            })
+            .collect()
+    }
+
+    /// Get the per-dimension offsets as [SliceParam] values.
+    pub fn slice_offsets(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
+        let attrs = self.get_attr_tensor_slice_params(ctx)?;
+        Some(self.slice_attr_to_params(ctx, &attrs.offsets))
+    }
+
+    /// Get the per-dimension sizes as [SliceParam] values.
+    pub fn slice_sizes(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
+        let attrs = self.get_attr_tensor_slice_params(ctx)?;
+        Some(self.slice_attr_to_params(ctx, &attrs.sizes))
+    }
+
+    /// Get the per-dimension steps as [SliceParam] values.
+    pub fn slice_steps(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
+        let attrs = self.get_attr_tensor_slice_params(ctx)?;
+        Some(self.slice_attr_to_params(ctx, &attrs.steps))
+    }
+
+    /// Get all dynamic operands (excluding the source tensor).
+    pub fn dynamic_operands(&self, ctx: &Context) -> Vec<Value> {
+        self.get_operation().deref(ctx).operands().skip(1).collect()
     }
 }

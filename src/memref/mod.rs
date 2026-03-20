@@ -1,5 +1,6 @@
 //! Memref dialect for pliron.
 
+pub mod attributes;
 pub mod conversions;
 pub mod descriptor;
 pub mod op_interfaces;

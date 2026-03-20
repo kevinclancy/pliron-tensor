@@ -29,13 +29,19 @@ use pliron::{
 };
 use pliron_common_dialects::{
     cf::{ToCFDialect, op_interfaces::YieldingRegion, ops::NDForOp},
-    index::ops::IndexConstantOp,
+    index::{
+        ops::{IndexConstantOp, IndexToIntegerOp, IntegerToIndexOp},
+        types::IndexType,
+    },
 };
 use pliron_llvm::{
     ToLLVMType, ToLLVMTypeFn,
     attributes::{FastmathFlagsAttr, IntegerOverflowFlagsAttr},
     function_call_utils::{compute_type_size_in_bytes, lookup_or_create_malloc_fn},
-    op_interfaces::{BinArithOp, FloatBinArithOpWithFastMathFlags, IntBinArithOpWithOverflowFlag},
+    op_interfaces::{
+        BinArithOp, CastOpInterface, FloatBinArithOpWithFastMathFlags,
+        IntBinArithOpWithOverflowFlag,
+    },
     ops::{BrOp, CallOp, FuncOp, MulOp},
 };
 
@@ -43,8 +49,8 @@ use crate::memref::{
     descriptor,
     op_interfaces::ElementWiseBinaryMemrefOpInterface,
     ops::{
-        AddOp, AllocOp, DivOp, GenerateOp, LoadOp, MatMulOp as MemrefMatMulOp,
-        MulOp as MemrefMulOp, StoreOp, SubOp, YieldOp,
+        AddOp, AllocOp, DivOp, ExtractSliceOp, GenerateOp, LoadOp, MatMulOp as MemrefMatMulOp,
+        MulOp as MemrefMulOp, SliceParam, StoreOp, SubOp, YieldOp,
     },
     type_interfaces::{MultiDimensionalType, ShapedType},
     types::RankedMemrefType,
@@ -724,6 +730,215 @@ impl ToCFDialect for MemrefMatMulOp {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ExtractSliceOpConversionErr {
+    #[error("Missing operand info for memref.extract_slice source operand")]
+    MissingSourceOperandInfo,
+    #[error("No RankedMemrefType found in source operand's previous types")]
+    NoRankedMemrefTypeForSource,
+    #[error("Missing slice_params attribute on memref.extract_slice")]
+    MissingSliceParams,
+}
+
+// Replace [ExtractSliceOp] with an [NDForOp] that iterates over the destination shape
+// and copies each element from the strided source location into the destination:
+//   for dst_idx in 0..size[dim]:  src_idx[dim] = offset[dim] + dst_idx[dim] * step[dim]
+//     dst[dst_idx] = src[src_idx]
+#[op_interface_impl]
+impl ToCFDialect for ExtractSliceOp {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operand_info: &[OperandConversionInfo],
+    ) -> Result<()> {
+        let destination = self.destination(ctx);
+        let source = self.source(ctx);
+
+        // Recover the element type from the source operand's original RankedMemrefType.
+        let element_ty = {
+            let tys = &operand_info
+                .iter()
+                .find(|info| info.operand == source)
+                .ok_or_else(|| {
+                    input_error!(
+                        self.loc(ctx),
+                        ExtractSliceOpConversionErr::MissingSourceOperandInfo
+                    )
+                })?
+                .previous_types;
+            tys.iter()
+                .rev()
+                .find_map(|ty| {
+                    let ty_ref = ty.deref(ctx);
+                    ty_ref
+                        .downcast_ref::<RankedMemrefType>()
+                        .map(|t| t.element_type())
+                })
+                .ok_or_else(|| {
+                    input_error!(
+                        self.loc(ctx),
+                        ExtractSliceOpConversionErr::NoRankedMemrefTypeForSource
+                    )
+                })?
+        };
+
+        let rank = self
+            .get_attr_slice_params(ctx)
+            .ok_or_else(|| {
+                input_error!(
+                    self.loc(ctx),
+                    ExtractSliceOpConversionErr::MissingSliceParams
+                )
+            })?
+            .offsets
+            .len();
+
+        // Convert an index Value to i64 type if needed.
+        fn to_i64(ctx: &mut Context, rewriter: &mut impl Rewriter<Recorder>, v: Value) -> Value {
+            let i64_ty: Ptr<TypeObj> = IntegerType::get(ctx, 64, Signedness::Signless).into();
+            if v.get_type(ctx).deref(ctx).is::<IndexType>() {
+                let cast = IndexToIntegerOp::new(ctx, v, i64_ty);
+                rewriter.append_op(ctx, cast);
+                cast.get_result(ctx)
+            } else {
+                v
+            }
+        }
+
+        // Convert an i64 Value to index type if needed.
+        fn to_index(ctx: &mut Context, rewriter: &mut impl Rewriter<Recorder>, v: Value) -> Value {
+            if v.get_type(ctx).deref(ctx).is::<IndexType>() {
+                v
+            } else {
+                let cast = IntegerToIndexOp::new(ctx, v, IndexType::get(ctx).into());
+                rewriter.append_op(ctx, cast);
+                cast.get_result(ctx)
+            }
+        }
+
+        // Resolve slice offsets / sizes / steps to SSA Values.
+        let mut offsets = Vec::with_capacity(rank);
+        for p in self.slice_offsets(ctx).expect("Missing slice offsets") {
+            let v = match p {
+                SliceParam::Static(val) => {
+                    let op = IndexConstantOp::new(ctx, val);
+                    rewriter.append_op(ctx, op);
+                    op.get_result(ctx)
+                }
+                SliceParam::Dynamic(v) => v,
+            };
+            offsets.push(v);
+        }
+        let mut sizes = Vec::with_capacity(rank);
+        for p in self.slice_sizes(ctx).expect("Missing slice sizes") {
+            let v = match p {
+                SliceParam::Static(val) => {
+                    let op = IndexConstantOp::new(ctx, val);
+                    rewriter.append_op(ctx, op);
+                    op.get_result(ctx)
+                }
+                SliceParam::Dynamic(v) => v,
+            };
+            sizes.push(v);
+        }
+        let mut steps = Vec::with_capacity(rank);
+        for p in self.slice_steps(ctx).expect("Missing slice steps") {
+            let v = match p {
+                SliceParam::Static(val) => {
+                    let op = IndexConstantOp::new(ctx, val);
+                    rewriter.append_op(ctx, op);
+                    op.get_result(ctx)
+                }
+                SliceParam::Dynamic(v) => v,
+            };
+            steps.push(v);
+        }
+
+        let const_zero = IndexConstantOp::new(ctx, 0);
+        let const_one = IndexConstantOp::new(ctx, 1);
+        rewriter.append_op(ctx, const_zero);
+        rewriter.append_op(ctx, const_one);
+        let lb0 = const_zero.get_result(ctx);
+        let step1 = const_one.get_result(ctx);
+        let lbs = vec![lb0; rank];
+        let loop_steps = vec![step1; rank];
+
+        let ndfor = {
+            let scoped_rewriter = ScopedRewriter::new(rewriter, OpInsertionPoint::Unset);
+            struct State<'a> {
+                rewriter: ScopedRewriter<'a, Recorder, IRRewriter<Recorder>>,
+                memref_dst: Value,
+                memref_src: Value,
+                offsets: Vec<Value>,
+                steps: Vec<Value>,
+                elem_ty: Ptr<TypeObj>,
+            }
+            let mut state = State {
+                rewriter: scoped_rewriter,
+                memref_dst: destination,
+                memref_src: source,
+                offsets,
+                steps,
+                elem_ty: element_ty,
+            };
+            NDForOp::new(
+                ctx,
+                lbs,
+                sizes,
+                loop_steps,
+                |ctx, state, inserter, dst_indices| {
+                    let rewriter = &mut state.rewriter;
+                    rewriter.set_insertion_point(inserter.get_insertion_point());
+
+                    // Compute src_idx[d] = offset[d] + dst_idx[d] * step[d] for each dim.
+                    let src_indices: Vec<Value> = state
+                        .offsets
+                        .iter()
+                        .zip(state.steps.iter())
+                        .zip(dst_indices.iter())
+                        .map(|((offset, step), dst_idx)| {
+                            // Since we use LLVM dialect for address computation,
+                            // we need to convert indices to i64 for arithmetic and
+                            // convert back to index at the end.
+                            let dst_idx = to_i64(ctx, rewriter, *dst_idx);
+                            let step = to_i64(ctx, rewriter, *step);
+                            let offset = to_i64(ctx, rewriter, *offset);
+                            let product = MulOp::new_with_overflow_flag(
+                                ctx,
+                                dst_idx,
+                                step,
+                                IntegerOverflowFlagsAttr::default(),
+                            );
+                            rewriter.append_op(ctx, product);
+                            let src_idx = pliron_llvm::ops::AddOp::new_with_overflow_flag(
+                                ctx,
+                                offset,
+                                product.get_result(ctx),
+                                IntegerOverflowFlagsAttr::default(),
+                            );
+                            rewriter.append_op(ctx, src_idx);
+                            let src_idx = src_idx.get_result(ctx);
+                            to_index(ctx, rewriter, src_idx)
+                        })
+                        .collect();
+
+                    let load = LoadOp::new(ctx, state.elem_ty, state.memref_src, src_indices);
+                    rewriter.append_op(ctx, load);
+                    let store =
+                        StoreOp::new(ctx, load.get_result(ctx), state.memref_dst, dst_indices);
+                    rewriter.append_op(ctx, store);
+                },
+                &mut state,
+            )
+        };
+
+        rewriter.append_op(ctx, ndfor);
+        rewriter.replace_operation(ctx, self.get_operation(), ndfor.get_operation());
+        Ok(())
+    }
+}
+
 /// Ranked memref types are converted to LLVM struct types with details.
 #[type_interface_impl]
 impl ToLLVMType for RankedMemrefType {
@@ -856,7 +1071,6 @@ impl DialectConversion for MemrefToCF {
         if let Some(load_op) = Operation::get_op::<pliron_llvm::ops::LoadOp>(op, ctx) {
             return lower_llvm_load_op_to_llvm(&load_op, ctx);
         }
-
         let op_dyn = Operation::get_op_dyn(op, ctx);
         let to_cf_op =
             op_cast::<dyn ToCFDialect>(&*op_dyn).expect("Matched Op must implement ToCFDialect");

@@ -28,13 +28,18 @@ use crate::{
     memref::{
         self, ToMemrefDialect, ToMemrefType, ToMemrefTypeFn, descriptor,
         op_interfaces::ElementWiseBinaryMemrefOpInterface,
-        ops::{AllocOp, MatMulOp as MemrefMatMulOp, YieldOp},
+        ops::{
+            AllocOp, ExtractSliceOp as MemrefExtractSliceOp, MatMulOp as MemrefMatMulOp, YieldOp,
+        },
         type_interfaces::{Dimension, MultiDimensionalType, ShapedType},
         types::RankedMemrefType,
     },
     tensor::{
         op_interfaces::ElementWiseBinaryTensorOpInterface,
-        ops::{AddOp, DivOp, ExtractOp, GenerateOp, MatMulOp, MulOp, SubOp},
+        ops::{
+            AddOp, DivOp, ExtractOp, ExtractSliceOp as TensorExtractSliceOp, GenerateOp, MatMulOp,
+            MulOp, SubOp,
+        },
         types::RankedTensorType,
     },
 };
@@ -388,6 +393,58 @@ fn lower_func_op_to_llvm(func_op: &FuncOp, ctx: &mut Context) -> Result<()> {
     }
 
     Ok(())
+}
+
+// Lowering for tensor::ExtractSliceOp -> memref::ExtractSliceOp
+#[op_interface_impl]
+impl ToMemrefDialect for TensorExtractSliceOp {
+    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
+        let result_ty_ptr = self.get_result(ctx).get_type(ctx);
+        let converter = {
+            let result_ty_ref = result_ty_ptr.deref(ctx);
+            let result_ty = result_ty_ref
+                .downcast_ref::<RankedTensorType>()
+                .expect("ExtractSliceOp must have a ranked tensor result");
+            result_ty.converter()
+        };
+        let result_ty = converter(result_ty_ptr, ctx)?;
+        let result_ty = TypePtr::<RankedMemrefType>::from_ptr(result_ty, ctx)
+            .expect("Expected the converted type to be a RankedMemrefType");
+
+        let source = self.source(ctx);
+        let offsets = self
+            .slice_offsets(ctx)
+            .expect("ExtractSliceOp must have slice params");
+        let sizes = self
+            .slice_sizes(ctx)
+            .expect("ExtractSliceOp must have slice params");
+        let steps = self
+            .slice_steps(ctx)
+            .expect("ExtractSliceOp must have slice params");
+
+        let dynamic_dim_operands = sizes
+            .iter()
+            .filter_map(|size| match size {
+                memref::ops::SliceParam::Dynamic(v) => Some(*v),
+                memref::ops::SliceParam::Static(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        let destination = AllocOp::new(ctx, result_ty, dynamic_dim_operands);
+        rewriter.append_op(ctx, destination);
+
+        let memref_op = MemrefExtractSliceOp::new(
+            ctx,
+            destination.get_result(ctx),
+            source,
+            offsets,
+            sizes,
+            steps,
+        );
+        rewriter.append_op(ctx, memref_op);
+        rewriter.replace_operation(ctx, self.get_operation(), destination.get_operation());
+        Ok(())
+    }
 }
 
 /// Implement [DialectConversion] for tensor to memref conversion.

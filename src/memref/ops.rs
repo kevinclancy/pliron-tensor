@@ -9,9 +9,9 @@ use pliron::{
         OneOpdInterface, OneRegionInterface, OneResultInterface, OperandSegmentInterface,
         SameOperandsType, SameResultsType, SingleBlockRegionInterface,
     },
-    combine::parser::{
-        Parser,
-        char::{self, spaces},
+    combine::{
+        Parser, attempt,
+        parser::char::{self, spaces},
     },
     common_traits::Verify,
     context::{Context, Ptr},
@@ -22,7 +22,9 @@ use pliron::{
         listener::DummyListener,
     },
     irfmt::{
-        parsers::{delimited_list_parser, process_parsed_ssa_defs, spaced, ssa_opd_parser},
+        parsers::{
+            delimited_list_parser, int_parser, process_parsed_ssa_defs, spaced, ssa_opd_parser,
+        },
         printers::iter_with_sep,
     },
     location::Location,
@@ -41,6 +43,7 @@ use pliron_common_dialects::{
 };
 
 use crate::memref::{
+    attributes::{SliceParamAttr, SliceParamsAttr},
     op_interfaces::{CompatibleShapesOp, ElementWiseBinaryMemrefOpInterface, GenerateOpInterface},
     type_interfaces::{MultiDimensionalType, ShapedType},
     types::RankedMemrefType,
@@ -819,5 +822,394 @@ impl MatMulOp {
     /// Get the right-hand side memref operand.
     pub fn get_rhs_memref(&self, ctx: &Context) -> Value {
         self.get_operation().deref(ctx).get_operand(2)
+    }
+}
+
+/// User-facing representation of a slice parameter (offset, size, or step).
+/// Can be either a static constant or a dynamic value.
+#[derive(Clone, Debug)]
+pub enum SliceParam {
+    /// A static usize constant value
+    Static(usize),
+    /// A dynamic Index value
+    Dynamic(Value),
+}
+
+/// Extract a narrow slice from a memref.
+///
+/// This operation extracts a contiguous slice from a source memref into a
+/// destination memref, specified by offsets, sizes, and strides per dimension.
+/// Each parameter can be static or dynamic.
+///
+/// ### Operand(s)
+/// | operand | description |
+/// |-----|-------|
+/// | `destination` | The destination memref to write the slice into (ranked memref). |
+/// | `source` | The source memref to extract from (ranked memref). |
+/// | `dynamic_offsets` | Zero or more [Index](IndexType) operands for dynamic offsets. |
+/// | `dynamic_sizes` | Zero or more [Index](IndexType) operands for dynamic sizes. |
+/// | `dynamic_steps` | Zero or more [Index](IndexType) operands for dynamic steps. |
+#[pliron_op(
+    name = "memref.extract_slice",
+    interfaces = [NResultsInterface<0>],
+    attributes = (slice_params: SliceParamsAttr)
+)]
+pub struct ExtractSliceOp;
+
+impl Printable for ExtractSliceOp {
+    fn fmt(
+        &self,
+        ctx: &Context,
+        _state: &printable::State,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        let destination = self.destination(ctx);
+        let source = self.source(ctx);
+        write!(
+            f,
+            "{} {} <- {}",
+            Self::get_opid_static(),
+            destination.disp(ctx),
+            source.disp(ctx)
+        )?;
+
+        let print_params =
+            |f: &mut std::fmt::Formatter, params: Vec<SliceParam>| -> std::fmt::Result {
+                write!(f, " [")?;
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    match p {
+                        SliceParam::Static(val) => write!(f, "{}", val)?,
+                        SliceParam::Dynamic(opd) => write!(f, "{}", opd.disp(ctx))?,
+                    }
+                }
+                write!(f, "]")
+            };
+        if let (Some(offsets), Some(sizes), Some(steps)) = (
+            self.slice_offsets(ctx),
+            self.slice_sizes(ctx),
+            self.slice_steps(ctx),
+        ) {
+            print_params(f, offsets)?;
+            print_params(f, sizes)?;
+            print_params(f, steps)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Parsable for ExtractSliceOp {
+    type Arg = Vec<(Identifier, Location)>;
+    type Parsed = OpObj;
+
+    fn parse<'a>(
+        state_stream: &mut parsable::StateStream<'a>,
+        results: Self::Arg,
+    ) -> parsable::ParseResult<'a, Self::Parsed> {
+        let slice_param_parser = || {
+            attempt(ssa_opd_parser().map(SliceParam::Dynamic))
+                .or(int_parser::<usize>().map(SliceParam::Static))
+                .boxed()
+        };
+
+        let (destination, source, offsets, sizes, steps) = (
+            ssa_opd_parser().skip(spaced(char::string("<-"))),
+            ssa_opd_parser().skip(spaces()),
+            delimited_list_parser('[', ']', ',', slice_param_parser()).skip(spaces()),
+            delimited_list_parser('[', ']', ',', slice_param_parser()).skip(spaces()),
+            delimited_list_parser('[', ']', ',', slice_param_parser()),
+        );
+
+        let ((destination, source, offsets, sizes, steps), _) =
+            (destination, source, offsets, sizes, steps)
+                .parse_stream(state_stream)
+                .into_result()?;
+
+        let op = ExtractSliceOp::new(
+            state_stream.state.ctx,
+            destination,
+            source,
+            offsets,
+            sizes,
+            steps,
+        );
+
+        process_parsed_ssa_defs(state_stream, &results, op.get_operation())?;
+        Ok(OpObj::new(op)).into_parse_result()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ExtractSliceOpVerifyErr {
+    #[error("ExtractSliceOp must have at least two operands (destination and source memrefs)")]
+    NotEnoughOperands,
+    #[error("The first operand of ExtractSliceOp must be a RankedMemrefType destination")]
+    FirstOperandNotDestinationMemref,
+    #[error("The second operand of ExtractSliceOp must be a RankedMemrefType source")]
+    SecondOperandNotSourceMemref,
+    #[error("ExtractSliceOp destination and source ranks must match")]
+    DestinationSourceRankMismatch,
+    #[error(
+        "ExtractSliceOp: All dynamic operands must be of IndexType, but operand {index} is {ty}"
+    )]
+    NonIndexOperand { index: usize, ty: String },
+    #[error(
+        "ExtractSliceOp: Number of dynamic operands ({got}) does not match number of dynamic parameters ({expected})"
+    )]
+    NumDynamicOperandsMismatch { expected: usize, got: usize },
+    #[error(
+        "ExtractSliceOp: Number of offsets ({got}) does not match rank of source memref ({expected})"
+    )]
+    NumOffsetsMismatch { expected: usize, got: usize },
+    #[error(
+        "ExtractSliceOp: Number of sizes ({got}) does not match rank of source memref ({expected})"
+    )]
+    NumSizesMismatch { expected: usize, got: usize },
+    #[error(
+        "ExtractSliceOp: Number of steps ({got}) does not match rank of source memref ({expected})"
+    )]
+    NumStepsMismatch { expected: usize, got: usize },
+    #[error("ExtractSliceOp: Missing slice_params attribute")]
+    MissingSliceParamsAttr,
+    #[error("ExtractSliceOp: Static step values must be non-zero (got 0 at dimension {dim})")]
+    InvalidStaticStep { dim: usize },
+}
+
+impl Verify for ExtractSliceOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+        let op_ref = self.get_operation().deref(ctx);
+        let mut operands = op_ref.operands();
+
+        let Some(destination_operand) = operands.next() else {
+            return verify_err!(loc, ExtractSliceOpVerifyErr::NotEnoughOperands);
+        };
+        let Some(source_operand) = operands.next() else {
+            return verify_err!(loc, ExtractSliceOpVerifyErr::NotEnoughOperands);
+        };
+
+        let destination_ty_ptr = destination_operand.get_type(ctx);
+        let destination_ty_ref = destination_ty_ptr.deref(ctx);
+        let destination_ty = destination_ty_ref
+            .downcast_ref::<RankedMemrefType>()
+            .ok_or_else(|| {
+                verify_error!(
+                    loc.clone(),
+                    ExtractSliceOpVerifyErr::FirstOperandNotDestinationMemref
+                )
+            })?;
+
+        let source_ty_ptr = source_operand.get_type(ctx);
+        let source_ty_ref = source_ty_ptr.deref(ctx);
+        let source_ty = source_ty_ref
+            .downcast_ref::<RankedMemrefType>()
+            .ok_or_else(|| {
+                verify_error!(
+                    loc.clone(),
+                    ExtractSliceOpVerifyErr::SecondOperandNotSourceMemref
+                )
+            })?;
+
+        let rank = source_ty.rank();
+        if destination_ty.rank() != rank {
+            return verify_err!(loc, ExtractSliceOpVerifyErr::DestinationSourceRankMismatch);
+        }
+
+        let slice_params = self.get_attr_slice_params(ctx).ok_or_else(|| {
+            verify_error!(loc.clone(), ExtractSliceOpVerifyErr::MissingSliceParamsAttr)
+        })?;
+
+        if slice_params.offsets.len() != rank {
+            return verify_err!(
+                loc,
+                ExtractSliceOpVerifyErr::NumOffsetsMismatch {
+                    expected: rank,
+                    got: slice_params.offsets.len()
+                }
+            );
+        }
+        if slice_params.sizes.len() != rank {
+            return verify_err!(
+                loc,
+                ExtractSliceOpVerifyErr::NumSizesMismatch {
+                    expected: rank,
+                    got: slice_params.sizes.len()
+                }
+            );
+        }
+        if slice_params.steps.len() != rank {
+            return verify_err!(
+                loc,
+                ExtractSliceOpVerifyErr::NumStepsMismatch {
+                    expected: rank,
+                    got: slice_params.steps.len()
+                }
+            );
+        }
+
+        for (dim, step) in slice_params.steps.iter().enumerate() {
+            if let SliceParamAttr::Static(0) = step {
+                return verify_err!(loc, ExtractSliceOpVerifyErr::InvalidStaticStep { dim });
+            }
+        }
+
+        let num_dynamic_offsets = slice_params
+            .offsets
+            .iter()
+            .filter(|p| matches!(p, SliceParamAttr::OperandIdx(_)))
+            .count();
+        let num_dynamic_sizes = slice_params
+            .sizes
+            .iter()
+            .filter(|p| matches!(p, SliceParamAttr::OperandIdx(_)))
+            .count();
+        let num_dynamic_steps = slice_params
+            .steps
+            .iter()
+            .filter(|p| matches!(p, SliceParamAttr::OperandIdx(_)))
+            .count();
+
+        let total_dynamic = num_dynamic_offsets + num_dynamic_sizes + num_dynamic_steps;
+        let remaining_operands: Vec<_> = operands.collect();
+
+        for (i, opd) in remaining_operands.iter().enumerate() {
+            let opd_ty = opd.get_type(ctx);
+            let opd_ty_ref = opd_ty.deref(ctx);
+            if !opd_ty_ref.is::<IndexType>() {
+                let ty_name = format!("{:?}", opd_ty_ref);
+                return verify_err!(
+                    loc,
+                    ExtractSliceOpVerifyErr::NonIndexOperand {
+                        index: i + 2,
+                        ty: ty_name
+                    }
+                );
+            }
+        }
+
+        if remaining_operands.len() != total_dynamic {
+            return verify_err!(
+                loc,
+                ExtractSliceOpVerifyErr::NumDynamicOperandsMismatch {
+                    expected: total_dynamic,
+                    got: remaining_operands.len()
+                }
+            );
+        }
+
+        Ok(())
+    }
+}
+
+impl ExtractSliceOp {
+    /// Create a new destination-style ExtractSliceOp.
+    pub fn new(
+        ctx: &mut Context,
+        destination: Value,
+        source: Value,
+        offsets: Vec<SliceParam>,
+        sizes: Vec<SliceParam>,
+        steps: Vec<SliceParam>,
+    ) -> Self {
+        let mut operands = vec![destination, source];
+        let mut offset_attrs = Vec::new();
+        let mut size_attrs = Vec::new();
+        let mut step_attrs = Vec::new();
+
+        for offset in offsets {
+            match offset {
+                SliceParam::Static(val) => offset_attrs.push(SliceParamAttr::Static(val)),
+                SliceParam::Dynamic(val) => {
+                    offset_attrs.push(SliceParamAttr::OperandIdx(operands.len()));
+                    operands.push(val);
+                }
+            }
+        }
+
+        for size in sizes {
+            match size {
+                SliceParam::Static(val) => size_attrs.push(SliceParamAttr::Static(val)),
+                SliceParam::Dynamic(val) => {
+                    size_attrs.push(SliceParamAttr::OperandIdx(operands.len()));
+                    operands.push(val);
+                }
+            }
+        }
+
+        for step in steps {
+            match step {
+                SliceParam::Static(val) => step_attrs.push(SliceParamAttr::Static(val)),
+                SliceParam::Dynamic(val) => {
+                    step_attrs.push(SliceParamAttr::OperandIdx(operands.len()));
+                    operands.push(val);
+                }
+            }
+        }
+
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            operands,
+            vec![],
+            0,
+        );
+        let op = Self { op };
+        op.set_attr_slice_params(
+            ctx,
+            SliceParamsAttr {
+                offsets: offset_attrs,
+                sizes: size_attrs,
+                steps: step_attrs,
+            },
+        );
+        op
+    }
+
+    /// Get the destination memref operand.
+    pub fn destination(&self, ctx: &Context) -> Value {
+        self.get_operation().deref(ctx).get_operand(0)
+    }
+
+    /// Get the source memref operand.
+    pub fn source(&self, ctx: &Context) -> Value {
+        self.get_operation().deref(ctx).get_operand(1)
+    }
+
+    fn slice_attr_to_params(&self, ctx: &Context, attrs: &[SliceParamAttr]) -> Vec<SliceParam> {
+        let op_ref = self.get_operation().deref(ctx);
+        attrs
+            .iter()
+            .map(|a| match a {
+                SliceParamAttr::Static(val) => SliceParam::Static(*val),
+                SliceParamAttr::OperandIdx(idx) => SliceParam::Dynamic(op_ref.get_operand(*idx)),
+            })
+            .collect()
+    }
+
+    /// Get the per-dimension offsets as [SliceParam] values.
+    pub fn slice_offsets(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
+        let attrs = self.get_attr_slice_params(ctx)?;
+        Some(self.slice_attr_to_params(ctx, &attrs.offsets))
+    }
+
+    /// Get the per-dimension sizes as [SliceParam] values.
+    pub fn slice_sizes(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
+        let attrs = self.get_attr_slice_params(ctx)?;
+        Some(self.slice_attr_to_params(ctx, &attrs.sizes))
+    }
+
+    /// Get the per-dimension steps as [SliceParam] values.
+    pub fn slice_steps(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
+        let attrs = self.get_attr_slice_params(ctx)?;
+        Some(self.slice_attr_to_params(ctx, &attrs.steps))
+    }
+
+    /// Get all dynamic operands (excluding destination and source memrefs).
+    pub fn dynamic_operands(&self, ctx: &Context) -> Vec<Value> {
+        self.get_operation().deref(ctx).operands().skip(2).collect()
     }
 }
