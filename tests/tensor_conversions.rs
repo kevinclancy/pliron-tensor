@@ -634,3 +634,55 @@ fn test_extract_slice_tensor_to_memref() {
         "destination-style memref.extract_slice syntax should be present"
     );
 }
+
+/// Test that `tensor.insert_slice` is lowered to memref / cf ops without leaving
+/// tensor dialect slice insertion behind.
+#[test]
+fn test_insert_slice_tensor_to_memref() {
+    init_env_logger();
+    let ctx = &mut Context::new();
+
+    let input_ir = r#"
+                builtin.module @test_module {
+                    ^entry():
+                        llvm.func @test_insert_slice: llvm.func <llvm.void (tensor.ranked<5x10:builtin.integer i64>, tensor.ranked<10x20:builtin.integer i64>) variadic = false> [] {
+                            ^entry(src : tensor.ranked<5x10:builtin.integer i64>, dst : tensor.ranked<10x20:builtin.integer i64>):
+                                updated = tensor.insert_slice src into dst [0, 2] [5, 10] [1, 2] : tensor.ranked<10x20:builtin.integer i64>;
+                                llvm.return
+                        }
+                }
+        "#;
+
+    let state_stream = state_stream_from_iterator(
+        input_ir.chars(),
+        parsable::State::new(ctx, location::Source::InMemory),
+    );
+    let parsed = spaced(Operation::top_level_parser())
+        .parse(state_stream)
+        .map(|(op, _)| op)
+        .map_err(|err| input_error_noloc!(err));
+    let parsed_op = parsed.expect_ok(ctx);
+    let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    apply_dialect_conversion(ctx, &mut TensorToMemref, parsed_op).expect_ok(ctx);
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    let printed = format!("{}", module_op.disp(ctx));
+    assert!(
+        !printed.contains("tensor.insert_slice"),
+        "tensor.insert_slice should have been lowered"
+    );
+    assert!(
+        printed.contains("memref.insert_slice"),
+        "memref.insert_slice should appear after lowering"
+    );
+    assert!(
+        printed.contains(" <- "),
+        "destination-style memref.insert_slice syntax should be present"
+    );
+    assert!(
+        printed.contains(" into "),
+        "memref.insert_slice syntax should mention the destination memref"
+    );
+}

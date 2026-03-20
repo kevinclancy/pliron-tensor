@@ -49,8 +49,8 @@ use crate::memref::{
     descriptor,
     op_interfaces::ElementWiseBinaryMemrefOpInterface,
     ops::{
-        AddOp, AllocOp, DivOp, ExtractSliceOp, GenerateOp, LoadOp, MatMulOp as MemrefMatMulOp,
-        MulOp as MemrefMulOp, SliceParam, StoreOp, SubOp, YieldOp,
+        AddOp, AllocOp, DivOp, ExtractSliceOp, GenerateOp, InsertSliceOp, LoadOp,
+        MatMulOp as MemrefMatMulOp, MulOp as MemrefMulOp, SliceParam, StoreOp, SubOp, YieldOp,
     },
     type_interfaces::{MultiDimensionalType, ShapedType},
     types::RankedMemrefType,
@@ -740,6 +740,16 @@ pub enum ExtractSliceOpConversionErr {
     MissingSliceParams,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum InsertSliceOpConversionErr {
+    #[error("Missing operand info for memref.insert_slice source operand")]
+    MissingSourceOperandInfo,
+    #[error("No RankedMemrefType found in source operand's previous types")]
+    NoRankedMemrefTypeForSource,
+    #[error("Missing insert_slice_params attribute on memref.insert_slice")]
+    MissingSliceParams,
+}
+
 // Replace [ExtractSliceOp] with an [NDForOp] that iterates over the destination shape
 // and copies each element from the strided source location into the destination:
 //   for dst_idx in 0..size[dim]:  src_idx[dim] = offset[dim] + dst_idx[dim] * step[dim]
@@ -924,6 +934,262 @@ impl ToCFDialect for ExtractSliceOp {
                         .collect();
 
                     let load = LoadOp::new(ctx, state.elem_ty, state.memref_src, src_indices);
+                    rewriter.append_op(ctx, load);
+                    let store =
+                        StoreOp::new(ctx, load.get_result(ctx), state.memref_dst, dst_indices);
+                    rewriter.append_op(ctx, store);
+                },
+                &mut state,
+            )
+        };
+
+        rewriter.append_op(ctx, ndfor);
+        rewriter.replace_operation(ctx, self.get_operation(), ndfor.get_operation());
+        Ok(())
+    }
+}
+
+// Replace [InsertSliceOp] with a sequence that first copies destination into the
+// result memref and then overwrites the slice region with values from the source.
+#[op_interface_impl]
+impl ToCFDialect for InsertSliceOp {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operand_info: &[OperandConversionInfo],
+    ) -> Result<()> {
+        let result_memref = self.result_memref(ctx);
+        let source = self.source(ctx);
+        let destination = self.destination(ctx);
+
+        let element_ty = {
+            let tys = &operand_info
+                .iter()
+                .find(|info| info.operand == source)
+                .ok_or_else(|| {
+                    input_error!(
+                        self.loc(ctx),
+                        InsertSliceOpConversionErr::MissingSourceOperandInfo
+                    )
+                })?
+                .previous_types;
+            tys.iter()
+                .rev()
+                .find_map(|ty| {
+                    let ty_ref = ty.deref(ctx);
+                    ty_ref
+                        .downcast_ref::<RankedMemrefType>()
+                        .map(|t| t.element_type())
+                })
+                .ok_or_else(|| {
+                    input_error!(
+                        self.loc(ctx),
+                        InsertSliceOpConversionErr::NoRankedMemrefTypeForSource
+                    )
+                })?
+        };
+
+        let rank = self
+            .get_attr_memref_insert_slice_params(ctx)
+            .ok_or_else(|| {
+                input_error!(
+                    self.loc(ctx),
+                    InsertSliceOpConversionErr::MissingSliceParams
+                )
+            })?
+            .offsets
+            .len();
+
+        let destination_shape = operand_info
+            .iter()
+            .find(|info| info.operand == destination)
+            .and_then(|info| {
+                info.previous_types.iter().rev().find_map(|ty| {
+                    let ty_ref = ty.deref(ctx);
+                    ty_ref
+                        .downcast_ref::<RankedMemrefType>()
+                        .map(|t| t.shape().clone())
+                })
+            })
+            .ok_or_else(|| {
+                input_error!(
+                    self.loc(ctx),
+                    InsertSliceOpConversionErr::NoRankedMemrefTypeForSource
+                )
+            })?;
+
+        fn to_i64(ctx: &mut Context, rewriter: &mut impl Rewriter<Recorder>, v: Value) -> Value {
+            let i64_ty: Ptr<TypeObj> = IntegerType::get(ctx, 64, Signedness::Signless).into();
+            if v.get_type(ctx).deref(ctx).is::<IndexType>() {
+                let cast = IndexToIntegerOp::new(ctx, v, i64_ty);
+                rewriter.append_op(ctx, cast);
+                cast.get_result(ctx)
+            } else {
+                v
+            }
+        }
+
+        fn to_index(ctx: &mut Context, rewriter: &mut impl Rewriter<Recorder>, v: Value) -> Value {
+            if v.get_type(ctx).deref(ctx).is::<IndexType>() {
+                v
+            } else {
+                let cast = IntegerToIndexOp::new(ctx, v, IndexType::get(ctx).into());
+                rewriter.append_op(ctx, cast);
+                cast.get_result(ctx)
+            }
+        }
+
+        let mut offsets = Vec::with_capacity(rank);
+        for p in self.slice_offsets(ctx).expect("Missing slice offsets") {
+            let v = match p {
+                SliceParam::Static(val) => {
+                    let op = IndexConstantOp::new(ctx, val);
+                    rewriter.append_op(ctx, op);
+                    op.get_result(ctx)
+                }
+                SliceParam::Dynamic(v) => v,
+            };
+            offsets.push(v);
+        }
+        let mut sizes = Vec::with_capacity(rank);
+        for p in self.slice_sizes(ctx).expect("Missing slice sizes") {
+            let v = match p {
+                SliceParam::Static(val) => {
+                    let op = IndexConstantOp::new(ctx, val);
+                    rewriter.append_op(ctx, op);
+                    op.get_result(ctx)
+                }
+                SliceParam::Dynamic(v) => v,
+            };
+            sizes.push(v);
+        }
+        let mut steps = Vec::with_capacity(rank);
+        for p in self.slice_steps(ctx).expect("Missing slice steps") {
+            let v = match p {
+                SliceParam::Static(val) => {
+                    let op = IndexConstantOp::new(ctx, val);
+                    rewriter.append_op(ctx, op);
+                    op.get_result(ctx)
+                }
+                SliceParam::Dynamic(v) => v,
+            };
+            steps.push(v);
+        }
+
+        let const_zero = IndexConstantOp::new(ctx, 0);
+        let const_one = IndexConstantOp::new(ctx, 1);
+        rewriter.append_op(ctx, const_zero);
+        rewriter.append_op(ctx, const_one);
+        let lb0 = const_zero.get_result(ctx);
+        let step1 = const_one.get_result(ctx);
+        let lbs = vec![lb0; rank];
+        let loop_steps = vec![step1; rank];
+
+        let destination_sizes = destination_shape
+            .iter()
+            .enumerate()
+            .map(|(i, dim)| match dim {
+                crate::memref::type_interfaces::Dimension::Static(size) => {
+                    let op = IndexConstantOp::new(ctx, *size);
+                    rewriter.append_op(ctx, op);
+                    op.get_result(ctx)
+                }
+                crate::memref::type_interfaces::Dimension::Dynamic => {
+                    descriptor::unpack_size(ctx, rewriter, destination, i)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let copy_ndfor = {
+            let scoped_rewriter = ScopedRewriter::new(rewriter, OpInsertionPoint::Unset);
+            struct CopyState<'a> {
+                rewriter: ScopedRewriter<'a, Recorder, IRRewriter<Recorder>>,
+                memref_dst: Value,
+                memref_src: Value,
+                elem_ty: Ptr<TypeObj>,
+            }
+            let mut state = CopyState {
+                rewriter: scoped_rewriter,
+                memref_dst: result_memref,
+                memref_src: destination,
+                elem_ty: element_ty,
+            };
+            NDForOp::new(
+                ctx,
+                lbs.clone(),
+                destination_sizes,
+                loop_steps.clone(),
+                |ctx, state, inserter, indices| {
+                    let rewriter = &mut state.rewriter;
+                    rewriter.set_insertion_point(inserter.get_insertion_point());
+                    let load = LoadOp::new(ctx, state.elem_ty, state.memref_src, indices.clone());
+                    rewriter.append_op(ctx, load);
+                    let store = StoreOp::new(ctx, load.get_result(ctx), state.memref_dst, indices);
+                    rewriter.append_op(ctx, store);
+                },
+                &mut state,
+            )
+        };
+        rewriter.append_op(ctx, copy_ndfor);
+
+        let ndfor = {
+            let scoped_rewriter = ScopedRewriter::new(rewriter, OpInsertionPoint::Unset);
+            struct State<'a> {
+                rewriter: ScopedRewriter<'a, Recorder, IRRewriter<Recorder>>,
+                memref_dst: Value,
+                memref_src: Value,
+                offsets: Vec<Value>,
+                steps: Vec<Value>,
+                elem_ty: Ptr<TypeObj>,
+            }
+            let mut state = State {
+                rewriter: scoped_rewriter,
+                memref_dst: result_memref,
+                memref_src: source,
+                offsets,
+                steps,
+                elem_ty: element_ty,
+            };
+            NDForOp::new(
+                ctx,
+                lbs,
+                sizes,
+                loop_steps,
+                |ctx, state, inserter, src_indices| {
+                    let rewriter = &mut state.rewriter;
+                    rewriter.set_insertion_point(inserter.get_insertion_point());
+
+                    let dst_indices: Vec<Value> = state
+                        .offsets
+                        .iter()
+                        .zip(state.steps.iter())
+                        .zip(src_indices.iter())
+                        .map(|((offset, step), src_idx)| {
+                            let src_idx = to_i64(ctx, rewriter, *src_idx);
+                            let step = to_i64(ctx, rewriter, *step);
+                            let offset = to_i64(ctx, rewriter, *offset);
+                            let product = MulOp::new_with_overflow_flag(
+                                ctx,
+                                src_idx,
+                                step,
+                                IntegerOverflowFlagsAttr::default(),
+                            );
+                            rewriter.append_op(ctx, product);
+                            let dst_idx = pliron_llvm::ops::AddOp::new_with_overflow_flag(
+                                ctx,
+                                offset,
+                                product.get_result(ctx),
+                                IntegerOverflowFlagsAttr::default(),
+                            );
+                            rewriter.append_op(ctx, dst_idx);
+                            let dst_idx = dst_idx.get_result(ctx);
+                            to_index(ctx, rewriter, dst_idx)
+                        })
+                        .collect();
+
+                    let load =
+                        LoadOp::new(ctx, state.elem_ty, state.memref_src, src_indices.clone());
                     rewriter.append_op(ctx, load);
                     let store =
                         StoreOp::new(ctx, load.get_result(ctx), state.memref_dst, dst_indices);

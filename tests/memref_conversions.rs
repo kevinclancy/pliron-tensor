@@ -346,3 +346,102 @@ fn test_extract_slice() {
         }
     }
 }
+
+/// Test that `memref.insert_slice` is correctly lowered to CF / LLVM.
+///
+/// The function initializes:
+/// - `src[i][j] = i*10 + j` for a 2x2 source memref
+/// - `dst[i][j] = 100 + i*4 + j` for a 3x4 destination memref
+///
+/// Then inserts `src` into `dst` at offsets [1, 1], writing the final result into `res`.
+#[test]
+fn test_insert_slice() {
+    common::init_env_logger();
+    let ctx = &mut Context::new();
+
+    let input_ir = r#"
+        builtin.module @test_module {
+          ^entry():
+          llvm.func @test_insert_slice: llvm.func <builtin.integer i64 (builtin.integer i64, builtin.integer i64) variadic = false> [] {
+            ^entry(i_arg: builtin.integer i64, j_arg: builtin.integer i64):
+            src = memref.alloc : memref.ranked<2 x 2 : builtin.integer i64>;
+            memref.generate src {
+              ^entry(i : index.index, j : index.index):
+              i_int = index.to_integer i to builtin.integer i64;
+              j_int = index.to_integer j to builtin.integer i64;
+              ten = llvm.constant <builtin.integer <10: i64>> : builtin.integer i64;
+              row = llvm.mul i_int, ten <{nsw = false, nuw = false}> : builtin.integer i64;
+              val = llvm.add row, j_int <{nsw = false, nuw = false}> : builtin.integer i64;
+              memref.yield val
+            };
+            dst = memref.alloc : memref.ranked<3 x 4 : builtin.integer i64>;
+            memref.generate dst {
+                      ^entry(di : index.index, dj : index.index):
+                        di_int = index.to_integer di to builtin.integer i64;
+                        dj_int = index.to_integer dj to builtin.integer i64;
+              four = llvm.constant <builtin.integer <4: i64>> : builtin.integer i64;
+              hundred = llvm.constant <builtin.integer <100: i64>> : builtin.integer i64;
+                        drow = llvm.mul di_int, four <{nsw = false, nuw = false}> : builtin.integer i64;
+                        dbase = llvm.add hundred, drow <{nsw = false, nuw = false}> : builtin.integer i64;
+                        dval = llvm.add dbase, dj_int <{nsw = false, nuw = false}> : builtin.integer i64;
+                        memref.yield dval
+            };
+            res = memref.alloc : memref.ranked<3 x 4 : builtin.integer i64>;
+            memref.insert_slice res <- src into dst [1, 1] [2, 2] [1, 1];
+            i_idx = index.from_integer i_arg : index.index;
+            j_idx = index.from_integer j_arg : index.index;
+            result = memref.load res[i_idx, j_idx]: builtin.integer i64;
+            llvm.return result
+          }
+        }
+        "#;
+
+    let state_stream = state_stream_from_iterator(
+        input_ir.chars(),
+        parsable::State::new(ctx, location::Source::InMemory),
+    );
+    let parsed = spaced(Operation::top_level_parser())
+        .parse(state_stream)
+        .map(|(op, _)| op)
+        .map_err(|err| input_error_noloc!(err));
+
+    let parsed_op = parsed.expect_ok(ctx);
+    let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
+    log::debug!("parsed module:\n{}", module_op.disp(ctx));
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
+    apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
+    log::debug!("converted module:\n{}", module_op.disp(ctx));
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    let llvm_ctx = LLVMContext::default();
+    let llvm_ir = pliron_llvm::to_llvm_ir::convert_module(ctx, &llvm_ctx, module_op).expect_ok(ctx);
+    llvm_ir
+        .verify()
+        .inspect_err(|e| eprintln!("LLVM-IR verification failed: {}", e))
+        .unwrap();
+    log::debug!("LLVM-IR generated:\n{}", llvm_ir);
+
+    initialize_native().expect("Failed to initialize native target for LLVM execution");
+    let jit = LLVMLLJIT::new_with_default_builder().expect("Failed to create LLJIT");
+    jit.add_module(llvm_ir)
+        .expect("Failed to add module to JIT");
+    let symbol_addr = jit
+        .lookup_symbol("test_insert_slice")
+        .expect("Failed to lookup symbol");
+    assert!(symbol_addr != 0);
+    let f = unsafe { std::mem::transmute::<u64, fn(i64, i64) -> i64>(symbol_addr) };
+
+    for i in 0..3_i64 {
+        for j in 0..4_i64 {
+            let result = f(i, j);
+            let expected = if (1..3).contains(&i) && (1..3).contains(&j) {
+                (i - 1) * 10 + (j - 1)
+            } else {
+                100 + i * 4 + j
+            };
+            assert_eq!(result, expected, "f({i}, {j}) = {result}");
+        }
+    }
+}

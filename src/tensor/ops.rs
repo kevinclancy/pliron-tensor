@@ -1158,3 +1158,463 @@ impl ExtractSliceOp {
         self.get_operation().deref(ctx).operands().skip(1).collect()
     }
 }
+
+/// Insert a tensor slice into another tensor of the same rank.
+///
+/// This operation inserts the source tensor into the destination tensor at the
+/// slice defined by offsets, sizes, and strides per dimension. Each parameter
+/// can be static or dynamic. The source, destination, and result must all have
+/// the same rank.
+///
+/// Similar to MLIR's
+/// [tensor.insert_slice](https://mlir.llvm.org/docs/Dialects/TensorOps/#tensorinsert_slice-tensorinsertsliceop),
+/// but rank-altering insertion is intentionally not supported here.
+#[pliron_op(
+    name = "tensor.insert_slice",
+    interfaces = [
+        OneResultInterface,
+        NResultsInterface<1>,
+        AllResultsOfType<RankedTensorType>,
+    ],
+    attributes = (insert_slice_params: SliceParamsAttr)
+)]
+pub struct InsertSliceOp;
+
+impl Printable for InsertSliceOp {
+    fn fmt(
+        &self,
+        ctx: &Context,
+        _state: &printable::State,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        let source = self.source(ctx);
+        let destination = self.destination(ctx);
+        write!(
+            f,
+            "{} {} into {}",
+            Self::get_opid_static(),
+            source.disp(ctx),
+            destination.disp(ctx)
+        )?;
+
+        let print_params =
+            |f: &mut std::fmt::Formatter, params: Vec<SliceParam>| -> std::fmt::Result {
+                write!(f, " [")?;
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    match p {
+                        SliceParam::Static(val) => write!(f, "{}", val)?,
+                        SliceParam::Dynamic(opd) => write!(f, "{}", opd.disp(ctx))?,
+                    }
+                }
+                write!(f, "]")
+            };
+        if let (Some(offsets), Some(sizes), Some(steps)) = (
+            self.slice_offsets(ctx),
+            self.slice_sizes(ctx),
+            self.slice_steps(ctx),
+        ) {
+            print_params(f, offsets)?;
+            print_params(f, sizes)?;
+            print_params(f, steps)?;
+        }
+
+        write!(f, " : {}", self.result_type(ctx).disp(ctx))?;
+
+        Ok(())
+    }
+}
+
+impl Parsable for InsertSliceOp {
+    type Arg = Vec<(Identifier, Location)>;
+    type Parsed = OpObj;
+
+    fn parse<'a>(
+        state_stream: &mut parsable::StateStream<'a>,
+        results: Self::Arg,
+    ) -> parsable::ParseResult<'a, Self::Parsed> {
+        let slice_param_parser = || {
+            attempt(ssa_opd_parser().map(SliceParam::Dynamic))
+                .or(int_parser::<usize>().map(SliceParam::Static))
+                .boxed()
+        };
+
+        let (source, destination, offsets, sizes, steps, result_ty) = (
+            ssa_opd_parser().skip(spaced(char::string("into"))),
+            ssa_opd_parser().skip(spaces()),
+            delimited_list_parser('[', ']', ',', slice_param_parser()).skip(spaces()),
+            delimited_list_parser('[', ']', ',', slice_param_parser()).skip(spaces()),
+            delimited_list_parser('[', ']', ',', slice_param_parser()),
+            spaced(char::string(":")).with(TypePtr::<RankedTensorType>::parser(())),
+        );
+
+        let ((source, destination, offsets, sizes, steps, result_ty), _) =
+            (source, destination, offsets, sizes, steps, result_ty)
+                .parse_stream(state_stream)
+                .into_result()?;
+
+        let op = InsertSliceOp::new_with_result_type(
+            state_stream.state.ctx,
+            source,
+            destination,
+            offsets,
+            sizes,
+            steps,
+            result_ty,
+        );
+
+        process_parsed_ssa_defs(state_stream, &results, op.get_operation())?;
+        Ok(OpObj::new(op)).into_parse_result()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InsertSliceOpVerifyErr {
+    #[error("InsertSliceOp must have at least two operands (the source and destination tensors)")]
+    NotEnoughOperands,
+    #[error("The first operand of InsertSliceOp must be a RankedTensorType source")]
+    FirstOperandNotSourceTensor,
+    #[error("The second operand of InsertSliceOp must be a RankedTensorType destination")]
+    SecondOperandNotDestinationTensor,
+    #[error("InsertSliceOp source and destination tensors must have the same rank")]
+    SourceDestinationRankMismatch,
+    #[error("InsertSliceOp source, destination, and result element types must match")]
+    ElementTypeMismatch,
+    #[error("InsertSliceOp result type must match the destination tensor type")]
+    ResultTypeMismatch,
+    #[error(
+        "InsertSliceOp: All dynamic operands must be of IndexType, but operand {index} is {ty}"
+    )]
+    NonIndexOperand { index: usize, ty: String },
+    #[error(
+        "InsertSliceOp: Number of dynamic operands ({got}) does not match number of dynamic parameters ({expected})"
+    )]
+    NumDynamicOperandsMismatch { expected: usize, got: usize },
+    #[error(
+        "InsertSliceOp: Number of offsets ({got}) does not match rank of source tensor ({expected})"
+    )]
+    NumOffsetsMismatch { expected: usize, got: usize },
+    #[error(
+        "InsertSliceOp: Number of sizes ({got}) does not match rank of source tensor ({expected})"
+    )]
+    NumSizesMismatch { expected: usize, got: usize },
+    #[error(
+        "InsertSliceOp: Number of steps ({got}) does not match rank of source tensor ({expected})"
+    )]
+    NumStepsMismatch { expected: usize, got: usize },
+    #[error("InsertSliceOp: Missing tensor.slice_params attribute")]
+    MissingSliceParamsAttr,
+    #[error("InsertSliceOp: Static step values must be non-zero (got 0 at dimension {dim})")]
+    InvalidStaticStep { dim: usize },
+    #[error(
+        "InsertSliceOp: Static size {size} at dimension {dim} does not match static source dimension {source_dim}"
+    )]
+    StaticSizeSourceMismatch {
+        dim: usize,
+        size: usize,
+        source_dim: usize,
+    },
+}
+
+impl Verify for InsertSliceOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
+        let op_ref = self.get_operation().deref(ctx);
+        let mut operands = op_ref.operands();
+
+        let Some(source_operand) = operands.next() else {
+            return verify_err!(loc, InsertSliceOpVerifyErr::NotEnoughOperands);
+        };
+        let Some(destination_operand) = operands.next() else {
+            return verify_err!(loc, InsertSliceOpVerifyErr::NotEnoughOperands);
+        };
+
+        let source_ty_ptr = source_operand.get_type(ctx);
+        let source_ty_ref = source_ty_ptr.deref(ctx);
+        let source_ty = source_ty_ref
+            .downcast_ref::<RankedTensorType>()
+            .ok_or_else(|| {
+                verify_error!(
+                    loc.clone(),
+                    InsertSliceOpVerifyErr::FirstOperandNotSourceTensor
+                )
+            })?;
+
+        let destination_ty_ptr = destination_operand.get_type(ctx);
+        let destination_ty_ref = destination_ty_ptr.deref(ctx);
+        let destination_ty = destination_ty_ref
+            .downcast_ref::<RankedTensorType>()
+            .ok_or_else(|| {
+                verify_error!(
+                    loc.clone(),
+                    InsertSliceOpVerifyErr::SecondOperandNotDestinationTensor
+                )
+            })?;
+
+        let rank = source_ty.rank();
+        if destination_ty.rank() != rank {
+            return verify_err!(loc, InsertSliceOpVerifyErr::SourceDestinationRankMismatch);
+        }
+
+        if source_ty.element_type() != destination_ty.element_type() {
+            return verify_err!(loc, InsertSliceOpVerifyErr::ElementTypeMismatch);
+        }
+
+        let result_ty_ptr = self.result_type(ctx);
+        let result_ty_ref = result_ty_ptr.deref(ctx);
+        let result_ty = result_ty_ref
+            .downcast_ref::<RankedTensorType>()
+            .ok_or_else(|| {
+                verify_error!(loc.clone(), InsertSliceOpVerifyErr::ResultTypeMismatch)
+            })?;
+
+        if result_ty.rank() != rank
+            || result_ty.shape() != destination_ty.shape()
+            || result_ty.element_type() != destination_ty.element_type()
+        {
+            return verify_err!(loc, InsertSliceOpVerifyErr::ResultTypeMismatch);
+        }
+
+        let slice_params = self.get_attr_insert_slice_params(ctx).ok_or_else(|| {
+            verify_error!(loc.clone(), InsertSliceOpVerifyErr::MissingSliceParamsAttr)
+        })?;
+
+        if slice_params.offsets.len() != rank {
+            return verify_err!(
+                loc,
+                InsertSliceOpVerifyErr::NumOffsetsMismatch {
+                    expected: rank,
+                    got: slice_params.offsets.len()
+                }
+            );
+        }
+        if slice_params.sizes.len() != rank {
+            return verify_err!(
+                loc,
+                InsertSliceOpVerifyErr::NumSizesMismatch {
+                    expected: rank,
+                    got: slice_params.sizes.len()
+                }
+            );
+        }
+        if slice_params.steps.len() != rank {
+            return verify_err!(
+                loc,
+                InsertSliceOpVerifyErr::NumStepsMismatch {
+                    expected: rank,
+                    got: slice_params.steps.len()
+                }
+            );
+        }
+
+        for (dim, step) in slice_params.steps.iter().enumerate() {
+            if let SliceParamAttr::Static(0) = step {
+                return verify_err!(loc, InsertSliceOpVerifyErr::InvalidStaticStep { dim });
+            }
+        }
+
+        for (dim, (size, source_dim)) in slice_params
+            .sizes
+            .iter()
+            .zip(source_ty.shape().iter())
+            .enumerate()
+        {
+            if let (
+                SliceParamAttr::Static(size),
+                crate::memref::type_interfaces::Dimension::Static(source_dim),
+            ) = (size, source_dim)
+                && size != source_dim
+            {
+                return verify_err!(
+                    loc,
+                    InsertSliceOpVerifyErr::StaticSizeSourceMismatch {
+                        dim,
+                        size: *size,
+                        source_dim: *source_dim
+                    }
+                );
+            }
+        }
+
+        let num_dynamic_offsets = slice_params
+            .offsets
+            .iter()
+            .filter(|p| matches!(p, SliceParamAttr::OperandIdx(_)))
+            .count();
+        let num_dynamic_sizes = slice_params
+            .sizes
+            .iter()
+            .filter(|p| matches!(p, SliceParamAttr::OperandIdx(_)))
+            .count();
+        let num_dynamic_steps = slice_params
+            .steps
+            .iter()
+            .filter(|p| matches!(p, SliceParamAttr::OperandIdx(_)))
+            .count();
+
+        let total_dynamic = num_dynamic_offsets + num_dynamic_sizes + num_dynamic_steps;
+        let remaining_operands: Vec<_> = operands.collect();
+
+        for (i, opd) in remaining_operands.iter().enumerate() {
+            let opd_ty = opd.get_type(ctx);
+            let opd_ty_ref = opd_ty.deref(ctx);
+            if !opd_ty_ref.is::<IndexType>() {
+                let ty_name = format!("{:?}", opd_ty_ref);
+                return verify_err!(
+                    loc,
+                    InsertSliceOpVerifyErr::NonIndexOperand {
+                        index: i + 2,
+                        ty: ty_name
+                    }
+                );
+            }
+        }
+
+        if remaining_operands.len() != total_dynamic {
+            return verify_err!(
+                loc,
+                InsertSliceOpVerifyErr::NumDynamicOperandsMismatch {
+                    expected: total_dynamic,
+                    got: remaining_operands.len()
+                }
+            );
+        }
+
+        Ok(())
+    }
+}
+
+impl InsertSliceOp {
+    /// Create a new InsertSliceOp with the given parameters.
+    ///
+    /// The result type is inferred from the destination tensor type.
+    pub fn new(
+        ctx: &mut Context,
+        source: Value,
+        destination: Value,
+        offsets: Vec<SliceParam>,
+        sizes: Vec<SliceParam>,
+        steps: Vec<SliceParam>,
+    ) -> Self {
+        let result_type = TypePtr::<RankedTensorType>::from_ptr(destination.get_type(ctx), ctx)
+            .expect("InsertSliceOp destination must be a RankedTensorType");
+
+        Self::new_with_result_type(ctx, source, destination, offsets, sizes, steps, result_type)
+    }
+
+    /// Create a new InsertSliceOp with an explicitly provided result type.
+    pub fn new_with_result_type(
+        ctx: &mut Context,
+        source: Value,
+        destination: Value,
+        offsets: Vec<SliceParam>,
+        sizes: Vec<SliceParam>,
+        steps: Vec<SliceParam>,
+        result_type: TypePtr<RankedTensorType>,
+    ) -> Self {
+        let mut operands = vec![source, destination];
+        let mut offset_attrs = Vec::new();
+        let mut size_attrs = Vec::new();
+        let mut step_attrs = Vec::new();
+
+        for offset in offsets {
+            match offset {
+                SliceParam::Static(val) => {
+                    offset_attrs.push(SliceParamAttr::Static(val));
+                }
+                SliceParam::Dynamic(val) => {
+                    offset_attrs.push(SliceParamAttr::OperandIdx(operands.len()));
+                    operands.push(val);
+                }
+            }
+        }
+
+        for size in sizes {
+            match size {
+                SliceParam::Static(val) => {
+                    size_attrs.push(SliceParamAttr::Static(val));
+                }
+                SliceParam::Dynamic(val) => {
+                    size_attrs.push(SliceParamAttr::OperandIdx(operands.len()));
+                    operands.push(val);
+                }
+            }
+        }
+
+        for step in steps {
+            match step {
+                SliceParam::Static(val) => {
+                    step_attrs.push(SliceParamAttr::Static(val));
+                }
+                SliceParam::Dynamic(val) => {
+                    step_attrs.push(SliceParamAttr::OperandIdx(operands.len()));
+                    operands.push(val);
+                }
+            }
+        }
+
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_type.into()],
+            operands,
+            vec![],
+            0,
+        );
+
+        let op = Self { op };
+        let slice_params = SliceParamsAttr {
+            offsets: offset_attrs,
+            sizes: size_attrs,
+            steps: step_attrs,
+        };
+        op.set_attr_insert_slice_params(ctx, slice_params);
+        op
+    }
+
+    /// Get the source tensor operand.
+    pub fn source(&self, ctx: &Context) -> Value {
+        self.get_operation().deref(ctx).get_operand(0)
+    }
+
+    /// Get the destination tensor operand.
+    pub fn destination(&self, ctx: &Context) -> Value {
+        self.get_operation().deref(ctx).get_operand(1)
+    }
+
+    fn slice_attr_to_params(&self, ctx: &Context, attrs: &[SliceParamAttr]) -> Vec<SliceParam> {
+        let op_ref = self.get_operation().deref(ctx);
+        attrs
+            .iter()
+            .map(|a| match a {
+                SliceParamAttr::Static(val) => SliceParam::Static(*val),
+                SliceParamAttr::OperandIdx(idx) => SliceParam::Dynamic(op_ref.get_operand(*idx)),
+            })
+            .collect()
+    }
+
+    /// Get the per-dimension offsets as [SliceParam] values.
+    pub fn slice_offsets(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
+        let attrs = self.get_attr_insert_slice_params(ctx)?;
+        Some(self.slice_attr_to_params(ctx, &attrs.offsets))
+    }
+
+    /// Get the per-dimension sizes as [SliceParam] values.
+    pub fn slice_sizes(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
+        let attrs = self.get_attr_insert_slice_params(ctx)?;
+        Some(self.slice_attr_to_params(ctx, &attrs.sizes))
+    }
+
+    /// Get the per-dimension steps as [SliceParam] values.
+    pub fn slice_steps(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
+        let attrs = self.get_attr_insert_slice_params(ctx)?;
+        Some(self.slice_attr_to_params(ctx, &attrs.steps))
+    }
+
+    /// Get all dynamic operands (excluding the source and destination tensors).
+    pub fn dynamic_operands(&self, ctx: &Context) -> Vec<Value> {
+        self.get_operation().deref(ctx).operands().skip(2).collect()
+    }
+}

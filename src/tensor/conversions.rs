@@ -29,7 +29,8 @@ use crate::{
         self, ToMemrefDialect, ToMemrefType, ToMemrefTypeFn, descriptor,
         op_interfaces::ElementWiseBinaryMemrefOpInterface,
         ops::{
-            AllocOp, ExtractSliceOp as MemrefExtractSliceOp, MatMulOp as MemrefMatMulOp, YieldOp,
+            AllocOp, ExtractSliceOp as MemrefExtractSliceOp, InsertSliceOp as MemrefInsertSliceOp,
+            MatMulOp as MemrefMatMulOp, YieldOp,
         },
         type_interfaces::{Dimension, MultiDimensionalType, ShapedType},
         types::RankedMemrefType,
@@ -37,8 +38,8 @@ use crate::{
     tensor::{
         op_interfaces::ElementWiseBinaryTensorOpInterface,
         ops::{
-            AddOp, DivOp, ExtractOp, ExtractSliceOp as TensorExtractSliceOp, GenerateOp, MatMulOp,
-            MulOp, SubOp,
+            AddOp, DivOp, ExtractOp, ExtractSliceOp as TensorExtractSliceOp, GenerateOp,
+            InsertSliceOp as TensorInsertSliceOp, MatMulOp, MulOp, SubOp,
         },
         types::RankedTensorType,
     },
@@ -443,6 +444,58 @@ impl ToMemrefDialect for TensorExtractSliceOp {
         );
         rewriter.append_op(ctx, memref_op);
         rewriter.replace_operation(ctx, self.get_operation(), destination.get_operation());
+        Ok(())
+    }
+}
+
+#[op_interface_impl]
+impl ToMemrefDialect for TensorInsertSliceOp {
+    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
+        let result_ty_ptr = self.get_result(ctx).get_type(ctx);
+        let converter = {
+            let result_ty_ref = result_ty_ptr.deref(ctx);
+            let result_ty = result_ty_ref
+                .downcast_ref::<RankedTensorType>()
+                .expect("InsertSliceOp must have a ranked tensor result");
+            result_ty.converter()
+        };
+        let result_ty = converter(result_ty_ptr, ctx)?;
+        let result_ty = TypePtr::<RankedMemrefType>::from_ptr(result_ty, ctx)
+            .expect("Expected the converted type to be a RankedMemrefType");
+
+        let source = self.source(ctx);
+        let destination = self.destination(ctx);
+
+        let result_shape = result_ty.deref(ctx).shape().clone();
+        let dynamic_dim_operands = result_shape
+            .iter()
+            .enumerate()
+            .filter_map(|(i, dim)| {
+                if let Dimension::Dynamic = dim {
+                    Some(descriptor::unpack_size(ctx, rewriter, destination, i))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let alloc = AllocOp::new(ctx, result_ty, dynamic_dim_operands);
+        rewriter.append_op(ctx, alloc);
+
+        let memref_op = MemrefInsertSliceOp::new(
+            ctx,
+            alloc.get_result(ctx),
+            source,
+            destination,
+            self.slice_offsets(ctx)
+                .expect("InsertSliceOp must have slice params"),
+            self.slice_sizes(ctx)
+                .expect("InsertSliceOp must have slice params"),
+            self.slice_steps(ctx)
+                .expect("InsertSliceOp must have slice params"),
+        );
+        rewriter.append_op(ctx, memref_op);
+        rewriter.replace_operation(ctx, self.get_operation(), alloc.get_operation());
         Ok(())
     }
 }
