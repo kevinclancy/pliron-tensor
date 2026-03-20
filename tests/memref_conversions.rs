@@ -387,7 +387,8 @@ fn test_insert_slice() {
                         memref.yield dval
             };
             res = memref.alloc : memref.ranked<3 x 4 : builtin.integer i64>;
-            memref.insert_slice res <- src into dst [1, 1] [2, 2] [1, 1];
+            one = index.constant <index.constant 1> : index.index;
+            memref.insert_slice res <- src into dst [one, one] [2, 2] [one, one];
             i_idx = index.from_integer i_arg : index.index;
             j_idx = index.from_integer j_arg : index.index;
             result = memref.load res[i_idx, j_idx]: builtin.integer i64;

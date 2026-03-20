@@ -9,7 +9,7 @@ use pliron::{
         SingleBlockRegionInterface,
     },
     combine::{
-        Parser, attempt,
+        Parser,
         parser::char::{self, spaces},
     },
     common_traits::Verify,
@@ -21,16 +21,14 @@ use pliron::{
         listener::DummyListener,
     },
     irfmt::{
-        parsers::{
-            delimited_list_parser, int_parser, process_parsed_ssa_defs, spaced, ssa_opd_parser,
-        },
-        printers::iter_with_sep,
+        parsers::{delimited_list_parser, process_parsed_ssa_defs, spaced, ssa_opd_parser},
+        printers::{iter_with_sep, list_with_sep},
     },
     location::Location,
     op::{Op, OpObj},
     operation::Operation,
     parsable::{self, IntoParseResult, Parsable},
-    printable::{self, Printable},
+    printable::{self, ListSeparator, Printable},
     result::Result,
     r#type::{TypeObj, TypePtr, Typed, type_cast},
     value::Value,
@@ -773,28 +771,26 @@ impl Printable for ExtractSliceOp {
         let source = self.source(ctx);
         write!(f, "{} {}", Self::get_opid_static(), source.disp(ctx))?;
 
-        let print_params =
-            |f: &mut std::fmt::Formatter, params: Vec<SliceParam>| -> std::fmt::Result {
-                write!(f, "[")?;
-                for (i, p) in params.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    match p {
-                        SliceParam::Static(val) => write!(f, "{}", val)?,
-                        SliceParam::Dynamic(opd) => write!(f, "{}", opd.disp(ctx))?,
-                    }
-                }
-                write!(f, "]")
-            };
         if let (Some(offsets), Some(sizes), Some(steps)) = (
             self.slice_offsets(ctx),
             self.slice_sizes(ctx),
             self.slice_steps(ctx),
         ) {
-            print_params(f, offsets)?;
-            print_params(f, sizes)?;
-            print_params(f, steps)?;
+            write!(
+                f,
+                "{}",
+                list_with_sep(&offsets, ListSeparator::CharSpace(',')).disp(ctx)
+            )?;
+            write!(
+                f,
+                "{}",
+                list_with_sep(&sizes, ListSeparator::CharSpace(',')).disp(ctx)
+            )?;
+            write!(
+                f,
+                "{}",
+                list_with_sep(&steps, ListSeparator::CharSpace(',')).disp(ctx)
+            )?;
         }
 
         write!(f, " : {}", self.result_type(ctx).disp(ctx))?;
@@ -811,17 +807,11 @@ impl Parsable for ExtractSliceOp {
         state_stream: &mut parsable::StateStream<'a>,
         results: Self::Arg,
     ) -> parsable::ParseResult<'a, Self::Parsed> {
-        let slice_param_parser = || {
-            attempt(ssa_opd_parser().map(SliceParam::Dynamic))
-                .or(int_parser::<usize>().map(SliceParam::Static))
-                .boxed()
-        };
-
         let (source, offsets, sizes, steps, result_ty) = (
             ssa_opd_parser().skip(spaces()),
-            delimited_list_parser('[', ']', ',', slice_param_parser()).skip(spaces()),
-            delimited_list_parser('[', ']', ',', slice_param_parser()).skip(spaces()),
-            delimited_list_parser('[', ']', ',', slice_param_parser()),
+            delimited_list_parser('[', ']', ',', SliceParam::parser(())).skip(spaces()),
+            delimited_list_parser('[', ']', ',', SliceParam::parser(())).skip(spaces()),
+            delimited_list_parser('[', ']', ',', SliceParam::parser(())),
             spaced(char::string(":")).with(TypePtr::<RankedTensorType>::parser(())),
         );
 
@@ -1197,28 +1187,26 @@ impl Printable for InsertSliceOp {
             destination.disp(ctx)
         )?;
 
-        let print_params =
-            |f: &mut std::fmt::Formatter, params: Vec<SliceParam>| -> std::fmt::Result {
-                write!(f, " [")?;
-                for (i, p) in params.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    match p {
-                        SliceParam::Static(val) => write!(f, "{}", val)?,
-                        SliceParam::Dynamic(opd) => write!(f, "{}", opd.disp(ctx))?,
-                    }
-                }
-                write!(f, "]")
-            };
         if let (Some(offsets), Some(sizes), Some(steps)) = (
             self.slice_offsets(ctx),
             self.slice_sizes(ctx),
             self.slice_steps(ctx),
         ) {
-            print_params(f, offsets)?;
-            print_params(f, sizes)?;
-            print_params(f, steps)?;
+            write!(
+                f,
+                " {}",
+                list_with_sep(&offsets, ListSeparator::CharSpace(',')).disp(ctx)
+            )?;
+            write!(
+                f,
+                " {}",
+                list_with_sep(&sizes, ListSeparator::CharSpace(',')).disp(ctx)
+            )?;
+            write!(
+                f,
+                " {}",
+                list_with_sep(&steps, ListSeparator::CharSpace(',')).disp(ctx)
+            )?;
         }
 
         write!(f, " : {}", self.result_type(ctx).disp(ctx))?;
@@ -1235,18 +1223,12 @@ impl Parsable for InsertSliceOp {
         state_stream: &mut parsable::StateStream<'a>,
         results: Self::Arg,
     ) -> parsable::ParseResult<'a, Self::Parsed> {
-        let slice_param_parser = || {
-            attempt(ssa_opd_parser().map(SliceParam::Dynamic))
-                .or(int_parser::<usize>().map(SliceParam::Static))
-                .boxed()
-        };
-
         let (source, destination, offsets, sizes, steps, result_ty) = (
             ssa_opd_parser().skip(spaced(char::string("into"))),
             ssa_opd_parser().skip(spaces()),
-            delimited_list_parser('[', ']', ',', slice_param_parser()).skip(spaces()),
-            delimited_list_parser('[', ']', ',', slice_param_parser()).skip(spaces()),
-            delimited_list_parser('[', ']', ',', slice_param_parser()),
+            delimited_list_parser('[', ']', ',', SliceParam::parser(())).skip(spaces()),
+            delimited_list_parser('[', ']', ',', SliceParam::parser(())).skip(spaces()),
+            delimited_list_parser('[', ']', ',', SliceParam::parser(())),
             spaced(char::string(":")).with(TypePtr::<RankedTensorType>::parser(())),
         );
 
