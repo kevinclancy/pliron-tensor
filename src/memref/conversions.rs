@@ -28,7 +28,11 @@ use pliron::{
     value::Value,
 };
 use pliron_common_dialects::{
-    cf::{ToCFDialect, op_interfaces::YieldingRegion, ops::NDForOp},
+    cf::{
+        ToCFDialect,
+        op_interfaces::YieldingRegion,
+        ops::{ForOp, NDForOp},
+    },
     index::{
         ops::{IndexConstantOp, IndexToIntegerOp, IntegerToIndexOp},
         types::IndexType,
@@ -42,7 +46,7 @@ use pliron_llvm::{
         BinArithOp, CastOpInterface, FloatBinArithOpWithFastMathFlags,
         IntBinArithOpWithOverflowFlag,
     },
-    ops::{BrOp, CallOp, FuncOp, MulOp},
+    ops::{BrOp, CallOp, FuncOp, GepIndex, GetElementPtrOp, MulOp},
 };
 
 use crate::memref::{
@@ -50,7 +54,8 @@ use crate::memref::{
     op_interfaces::ElementWiseBinaryMemrefOpInterface,
     ops::{
         AddOp, AllocOp, DivOp, ExtractSliceOp, GenerateOp, InsertSliceOp, LoadOp,
-        MatMulOp as MemrefMatMulOp, MulOp as MemrefMulOp, SliceParam, StoreOp, SubOp, YieldOp,
+        MatMulOp as MemrefMatMulOp, MulOp as MemrefMulOp, ReshapeOp, SliceParam, StoreOp, SubOp,
+        YieldOp,
     },
     type_interfaces::{MultiDimensionalType, ShapedType},
     types::RankedMemrefType,
@@ -1289,7 +1294,11 @@ fn lower_func_op_to_llvm(func_op: &FuncOp, ctx: &mut Context) -> Result<()> {
     Ok(())
 }
 
-fn lower_llvm_load_op_to_llvm(load_op: &pliron_llvm::ops::LoadOp, ctx: &mut Context) -> Result<()> {
+fn lower_llvm_load_op_to_llvm(
+    load_op: &pliron_llvm::ops::LoadOp,
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+) -> Result<()> {
     let loaded_ty = load_op.get_result(ctx).get_type(ctx);
     let to_memref_ty = type_cast::<dyn ToLLVMType>(&**loaded_ty.deref(ctx)).map(|t| t.converter());
     let memref_ty = if let Some(to_memref_ty) = to_memref_ty {
@@ -1297,8 +1306,154 @@ fn lower_llvm_load_op_to_llvm(load_op: &pliron_llvm::ops::LoadOp, ctx: &mut Cont
     } else {
         loaded_ty
     };
-    load_op.get_result(ctx).set_type(ctx, memref_ty);
+    rewriter.set_value_type(ctx, load_op.get_result(ctx), memref_ty);
     Ok(())
+}
+
+// Replace [ReshapeOp] with a 1-D flat copy loop that copies all elements from
+// the source memref into the pre-allocated destination memref, treating both as
+// contiguous row-major arrays.  Because both source and destination are contiguous
+// (produced by [AllocOp]), element i in linear order is at
+//   aligned_ptr[offset + i]
+// for both operands, so the loop simply does:
+//   for i in [0, num_elems): dst[offset_dst + i] = src[offset_src + i]
+#[op_interface_impl]
+impl ToCFDialect for ReshapeOp {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operand_info: &[OperandConversionInfo],
+    ) -> Result<()> {
+        let destination = self.get_destination(ctx);
+        let source = self.get_source(ctx);
+
+        // Recover element type from operand_info (types may have been converted
+        // to LLVM structs by the time CF lowering runs).
+        let element_ty = {
+            let tys = &operand_info
+                .iter()
+                .find(|info| info.operand == source)
+                .expect("Expected to find operand info for the source memref")
+                .previous_types;
+            tys.iter()
+                .rev()
+                .find_map(|ty| {
+                    let ty_ref = ty.deref(ctx);
+                    ty_ref
+                        .downcast_ref::<RankedMemrefType>()
+                        .map(|t| t.element_type())
+                })
+                .expect("Expected a RankedMemrefType in the previous types of the source memref")
+        };
+
+        // Compute total element count from the destination's sizes.
+        let dst_sizes = descriptor::unpack_sizes(ctx, rewriter, destination);
+        let i64_ty: Ptr<TypeObj> = IntegerType::get(ctx, 64, Signedness::Signless).into();
+        let const_one = IndexConstantOp::new(ctx, 1);
+        rewriter.append_op(ctx, const_one);
+        let const_one_i64 = IndexToIntegerOp::new(ctx, const_one.get_result(ctx), i64_ty);
+        rewriter.append_op(ctx, const_one_i64);
+        let num_elems_i64 = dst_sizes
+            .iter()
+            .fold(const_one_i64.get_result(ctx), |acc, &sz| {
+                let mul = MulOp::new_with_overflow_flag(
+                    ctx,
+                    acc,
+                    sz,
+                    IntegerOverflowFlagsAttr::default(),
+                );
+                rewriter.append_op(ctx, mul);
+                mul.get_result(ctx)
+            });
+        let num_elems = IntegerToIndexOp::new(ctx, num_elems_i64, IndexType::get(ctx).into());
+        rewriter.append_op(ctx, num_elems);
+
+        // Base pointers at their respective offsets — we add the flat loop index
+        // as a second GEP step inside the loop body.
+        let src_aligned_ptr = descriptor::unpack_aligned_ptr(ctx, rewriter, source);
+        let src_offset = descriptor::unpack_offset(ctx, rewriter, source);
+        let src_base = GetElementPtrOp::new(
+            ctx,
+            src_aligned_ptr,
+            vec![GepIndex::Value(src_offset)],
+            element_ty,
+        );
+        rewriter.append_op(ctx, src_base);
+
+        let dst_aligned_ptr = descriptor::unpack_aligned_ptr(ctx, rewriter, destination);
+        let dst_offset = descriptor::unpack_offset(ctx, rewriter, destination);
+        let dst_base = GetElementPtrOp::new(
+            ctx,
+            dst_aligned_ptr,
+            vec![GepIndex::Value(dst_offset)],
+            element_ty,
+        );
+        rewriter.append_op(ctx, dst_base);
+
+        let const_zero = IndexConstantOp::new(ctx, 0);
+        let const_step = IndexConstantOp::new(ctx, 1);
+        rewriter.append_op(ctx, const_zero);
+        rewriter.append_op(ctx, const_step);
+
+        let forop = {
+            struct State {
+                src_base: Value,
+                dst_base: Value,
+                elem_ty: Ptr<TypeObj>,
+            }
+            let mut state = State {
+                src_base: src_base.get_result(ctx),
+                dst_base: dst_base.get_result(ctx),
+                elem_ty: element_ty,
+            };
+            ForOp::new(
+                ctx,
+                const_zero.get_result(ctx),
+                num_elems.get_result(ctx),
+                const_step.get_result(ctx),
+                &[],
+                |ctx, state, inserter, i, iter_args| {
+                    assert!(
+                        iter_args.is_empty(),
+                        "ReshapeOp copy loop should not have iter args"
+                    );
+
+                    let src_ptr = GetElementPtrOp::new(
+                        ctx,
+                        state.src_base,
+                        vec![GepIndex::Value(i)],
+                        state.elem_ty,
+                    );
+                    inserter.append_op(ctx, src_ptr);
+                    let load =
+                        pliron_llvm::ops::LoadOp::new(ctx, src_ptr.get_result(ctx), state.elem_ty);
+                    inserter.append_op(ctx, load);
+
+                    let dst_ptr = GetElementPtrOp::new(
+                        ctx,
+                        state.dst_base,
+                        vec![GepIndex::Value(i)],
+                        state.elem_ty,
+                    );
+                    inserter.append_op(ctx, dst_ptr);
+                    let store = pliron_llvm::ops::StoreOp::new(
+                        ctx,
+                        load.get_result(ctx),
+                        dst_ptr.get_result(ctx),
+                    );
+                    inserter.append_op(ctx, store);
+
+                    vec![]
+                },
+                &mut state,
+            )
+        };
+
+        rewriter.append_op(ctx, forop);
+        rewriter.replace_operation(ctx, self.get_operation(), forop.get_operation());
+        Ok(())
+    }
 }
 
 /// Implement [DialectConversion] for control-flow to CF conversion.
@@ -1335,7 +1490,7 @@ impl DialectConversion for MemrefToCF {
             return lower_func_op_to_llvm(&func_op, ctx);
         }
         if let Some(load_op) = Operation::get_op::<pliron_llvm::ops::LoadOp>(op, ctx) {
-            return lower_llvm_load_op_to_llvm(&load_op, ctx);
+            return lower_llvm_load_op_to_llvm(&load_op, ctx, rewriter);
         }
         let op_dyn = Operation::get_op_dyn(op, ctx);
         let to_cf_op =

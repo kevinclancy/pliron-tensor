@@ -30,7 +30,7 @@ use crate::{
         op_interfaces::ElementWiseBinaryMemrefOpInterface,
         ops::{
             AllocOp, ExtractSliceOp as MemrefExtractSliceOp, InsertSliceOp as MemrefInsertSliceOp,
-            MatMulOp as MemrefMatMulOp, YieldOp,
+            MatMulOp as MemrefMatMulOp, ReshapeOp as MemrefReshapeOp, YieldOp,
         },
         type_interfaces::{Dimension, MultiDimensionalType, ShapedType},
         types::RankedMemrefType,
@@ -39,7 +39,8 @@ use crate::{
         op_interfaces::ElementWiseBinaryTensorOpInterface,
         ops::{
             AddOp, DivOp, ExtractOp, ExtractSliceOp as TensorExtractSliceOp, GenerateOp,
-            InsertSliceOp as TensorInsertSliceOp, MatMulOp, MulOp, SubOp,
+            InsertSliceOp as TensorInsertSliceOp, MatMulOp, MulOp, ReshapeOp as TensorReshapeOp,
+            SubOp,
         },
         types::RankedTensorType,
     },
@@ -282,7 +283,7 @@ impl ToMemrefDialect for DivOp {
 
 #[op_interface_impl]
 impl ToMemrefDialect for pliron_llvm::ops::LoadOp {
-    fn rewrite(&self, ctx: &mut Context, _rewriter: &mut DialectConversionRewriter) -> Result<()> {
+    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
         let loaded_ty = self.get_result(ctx).get_type(ctx);
         let to_memref_ty =
             type_cast::<dyn ToMemrefType>(&**loaded_ty.deref(ctx)).map(|t| t.converter());
@@ -291,7 +292,7 @@ impl ToMemrefDialect for pliron_llvm::ops::LoadOp {
         } else {
             loaded_ty
         };
-        self.get_result(ctx).set_type(ctx, memref_ty);
+        rewriter.set_value_type(ctx, self.get_result(ctx), memref_ty);
         Ok(())
     }
 }
@@ -495,6 +496,39 @@ impl ToMemrefDialect for TensorInsertSliceOp {
                 .expect("InsertSliceOp must have slice params"),
         );
         rewriter.append_op(ctx, memref_op);
+        rewriter.replace_operation(ctx, self.get_operation(), alloc.get_operation());
+        Ok(())
+    }
+}
+
+// Lowering for tensor::ReshapeOp -> memref::ReshapeOp
+#[op_interface_impl]
+impl ToMemrefDialect for TensorReshapeOp {
+    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
+        let source = self.get_source(ctx);
+        let result_ty_ptr = self.get_result(ctx).get_type(ctx);
+        let converter = {
+            let result_ty_ref = result_ty_ptr.deref(ctx);
+            let result_ty = result_ty_ref
+                .downcast_ref::<RankedTensorType>()
+                .expect("ReshapeOp must have a ranked tensor result");
+            result_ty.converter()
+        };
+        let result_ty = converter(result_ty_ptr, ctx)?;
+        let result_ty = TypePtr::<RankedMemrefType>::from_ptr(result_ty, ctx)
+            .expect("Expected the converted type to be a RankedMemrefType");
+
+        // Allocate the destination memref. The dynamic dimensions from the tensor
+        // reshape become the dynamic dimension operands for AllocOp.
+        let dyn_dims = self.get_dynamic_dimensions(ctx);
+        let alloc = AllocOp::new(ctx, result_ty, dyn_dims);
+        rewriter.append_op(ctx, alloc);
+
+        // Copy source elements into the freshly allocated destination.
+        let memref_reshape = MemrefReshapeOp::new(ctx, alloc.get_result(ctx), source);
+        rewriter.append_op(ctx, memref_reshape);
+
+        // Replace all uses of the tensor result with the allocated destination.
         rewriter.replace_operation(ctx, self.get_operation(), alloc.get_operation());
         Ok(())
     }

@@ -611,9 +611,14 @@ fn test_extract_slice_tensor_to_memref() {
         .map_err(|err| input_error_noloc!(err));
     let parsed_op = parsed.expect_ok(ctx);
     let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
+    log::debug!("pliron module parsed {}", module_op.disp(ctx));
     verify_op(&module_op, ctx).expect_ok(ctx);
 
     apply_dialect_conversion(ctx, &mut TensorToMemref, parsed_op).expect_ok(ctx);
+    log::debug!(
+        "pliron module after TensorToMemref conversion {}",
+        module_op.disp(ctx)
+    );
     verify_op(&module_op, ctx).expect_ok(ctx);
 
     let printed = format!("{}", module_op.disp(ctx));
@@ -659,9 +664,14 @@ fn test_insert_slice_tensor_to_memref() {
         .map_err(|err| input_error_noloc!(err));
     let parsed_op = parsed.expect_ok(ctx);
     let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
+    log::debug!("pliron module parsed {}", module_op.disp(ctx));
     verify_op(&module_op, ctx).expect_ok(ctx);
 
     apply_dialect_conversion(ctx, &mut TensorToMemref, parsed_op).expect_ok(ctx);
+    log::debug!(
+        "pliron module after TensorToMemref conversion {}",
+        module_op.disp(ctx)
+    );
     verify_op(&module_op, ctx).expect_ok(ctx);
 
     let printed = format!("{}", module_op.disp(ctx));
@@ -681,4 +691,94 @@ fn test_insert_slice_tensor_to_memref() {
         printed.contains(" into "),
         "memref.insert_slice syntax should mention the destination memref"
     );
+}
+
+/// End-to-end test for tensor.reshape lowering:
+/// tensor.reshape -> memref.reshape (TensorToMemref), then
+/// memref.reshape -> cf.for + copy (MemrefToCF), then LLVM.
+#[test]
+fn test_tensor_reshape_to_memref_cf_from_rust() {
+    init_env_logger!();
+    let ctx = &mut Context::default();
+
+    let input_ir = r#"
+            builtin.module @test_module {
+              ^entry():
+                llvm.func @test_tensor_reshape_extract: llvm.func <builtin.integer i64 (llvm.ptr, builtin.integer i64, builtin.integer i64) variadic = false> [] {
+                  ^entry(arg_p: llvm.ptr, i_res: builtin.integer i64, j_res: builtin.integer i64):
+                    arg = llvm.load arg_p : tensor.ranked<2x3:builtin.integer i64>;
+                    reshaped = tensor.reshape arg() : tensor.ranked<3x2:builtin.integer i64>;
+                    i_idx = index.from_integer i_res : index.index;
+                    j_idx = index.from_integer j_res : index.index;
+                    res = tensor.extract reshaped[i_idx, j_idx]: builtin.integer i64;
+                    llvm.return res
+                }
+            }
+            "#;
+
+    let state_stream = state_stream_from_iterator(
+        input_ir.chars(),
+        parsable::State::new(ctx, location::Source::InMemory),
+    );
+    let parsed = spaced(Operation::top_level_parser())
+        .parse(state_stream)
+        .map(|(op, _)| op)
+        .map_err(|err| input_error_noloc!(err));
+
+    let parsed_op = parsed.expect_ok(ctx);
+    let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
+    log::debug!("pliron module parsed {}", module_op.disp(ctx));
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    apply_dialect_conversion(ctx, &mut TensorToMemref, parsed_op).expect_ok(ctx);
+    let after_tensor_to_memref = format!("{}", module_op.disp(ctx));
+    assert!(
+        !after_tensor_to_memref.contains("tensor.reshape"),
+        "tensor.reshape should be lowered by TensorToMemref"
+    );
+    assert!(
+        after_tensor_to_memref.contains("memref.reshape"),
+        "memref.reshape should appear after TensorToMemref"
+    );
+
+    apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
+    apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
+    log::debug!(
+        "pliron module after dialect conversion to LLVM {}",
+        module_op.disp(ctx)
+    );
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    let llvm_ctx = LLVMContext::default();
+    let llvm_ir = pliron_llvm::to_llvm_ir::convert_module(ctx, &llvm_ctx, module_op).expect_ok(ctx);
+    llvm_ir
+        .verify()
+        .inspect_err(|e| eprintln!("LLVM-IR verification failed: {}", e))
+        .unwrap();
+    log::debug!("LLVM-IR generated:\n{}", llvm_ir);
+
+    initialize_native().expect("Failed to initialize native target for LLVM execution");
+    let jit = LLVMLLJIT::new_with_default_builder().expect("Failed to create LLJIT");
+    jit.add_module(llvm_ir)
+        .expect("Failed to add module to JIT");
+    let symbol_addr = jit
+        .lookup_symbol("test_tensor_reshape_extract")
+        .expect("Failed to lookup symbol");
+    assert!(symbol_addr != 0);
+
+    let input = TensorDesciptor::new(
+        [2, 3].to_vec(),
+        std::mem::size_of::<u64>(),
+        [1u64, 2, 3, 4, 5, 6].as_ptr() as *const u8,
+    );
+
+    let f = unsafe {
+        std::mem::transmute::<u64, extern "C" fn(*const u8, i64, i64) -> i64>(symbol_addr)
+    };
+
+    // 2x3 row-major [1,2,3,4,5,6] reshaped to 3x2 is:
+    // [[1,2], [3,4], [5,6]]
+    assert_eq!(f(input.build_ir_descriptor().as_ptr(), 0, 0), 1);
+    assert_eq!(f(input.build_ir_descriptor().as_ptr(), 1, 0), 3);
+    assert_eq!(f(input.build_ir_descriptor().as_ptr(), 2, 1), 6);
 }

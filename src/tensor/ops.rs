@@ -4,9 +4,9 @@ use std::cell::Ref;
 
 use pliron::{
     builtin::op_interfaces::{
-        AllOperandsOfType, AllResultsOfType, NOpdsInterface, NRegionsInterface, NResultsInterface,
-        OneRegionInterface, OneResultInterface, OperandSegmentInterface,
-        SingleBlockRegionInterface,
+        AllOperandsOfType, AllResultsOfType, AtLeastNOpdsInterface, NOpdsInterface,
+        NRegionsInterface, NResultsInterface, OneRegionInterface, OneResultInterface,
+        OperandSegmentInterface, SingleBlockRegionInterface,
     },
     combine::{
         Parser,
@@ -1598,5 +1598,213 @@ impl InsertSliceOp {
     /// Get all dynamic operands (excluding the source and destination tensors).
     pub fn dynamic_operands(&self, ctx: &Context) -> Vec<Value> {
         self.get_operation().deref(ctx).operands().skip(2).collect()
+    }
+}
+
+/// Reshape a tensor to a new shape.
+/// The operation takes a source tensor and a set of dynamic dimension operands
+/// (one per dynamic dimension in the result type), and produces a result tensor
+/// with the specified shape. The total number of elements must be the same.
+///
+/// See MLIR's [tensor.reshape](https://mlir.llvm.org/docs/Dialects/TensorOps/#tensorreshape-tensorreshapeop).
+/// Unlike MLIR, only ranked tensors are supported (no unranked tensors).
+///
+/// ### Operand(s)
+/// | operand | description |
+/// |-----|-------|
+/// | `source` | The source ranked tensor to reshape. |
+/// | `dynamic_dimensions` | One [Index](IndexType) operand per dynamic dimension in the result type. |
+///
+/// ### Result(s)
+/// | result | description |
+/// |-----|-------|
+/// | `result` | The reshaped tensor with the new shape. |
+#[pliron_op(
+    name = "tensor.reshape",
+    interfaces = [
+        OneResultInterface,
+        NResultsInterface<1>,
+        AtLeastNOpdsInterface<1>,
+        AllResultsOfType<RankedTensorType>,
+    ],
+)]
+pub struct ReshapeOp;
+
+impl Printable for ReshapeOp {
+    fn fmt(
+        &self,
+        ctx: &Context,
+        _state: &printable::State,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        let source = self.get_source(ctx);
+        let dyn_dims = self.get_dynamic_dimensions(ctx);
+        write!(f, "{} {}(", Self::get_opid_static(), source.disp(ctx))?;
+        write!(
+            f,
+            "{}",
+            iter_with_sep(dyn_dims.iter(), ListSeparator::CharSpace(',')).disp(ctx)
+        )?;
+        write!(f, ") : {}", self.result_type(ctx).disp(ctx))
+    }
+}
+
+impl Parsable for ReshapeOp {
+    type Arg = Vec<(Identifier, Location)>;
+    type Parsed = OpObj;
+
+    fn parse<'a>(
+        state_stream: &mut parsable::StateStream<'a>,
+        results: Self::Arg,
+    ) -> parsable::ParseResult<'a, Self::Parsed> {
+        let (source, dyn_dims, result_ty) = (
+            ssa_opd_parser().skip(spaces()),
+            delimited_list_parser('(', ')', ',', ssa_opd_parser()),
+            spaced(char::string(":")).with(TypePtr::<RankedTensorType>::parser(())),
+        );
+
+        let ((source, dyn_dims, result_ty), _) = (source, dyn_dims, result_ty)
+            .parse_stream(state_stream)
+            .into_result()?;
+
+        let op = ReshapeOp::new(state_stream.state.ctx, source, dyn_dims, result_ty);
+        process_parsed_ssa_defs(state_stream, &results, op.get_operation())?;
+        Ok(OpObj::new(op)).into_parse_result()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReshapeOpVerifyErr {
+    #[error("ReshapeOp source must be a RankedTensorType")]
+    SourceNotRankedTensor,
+    #[error("ReshapeOp source and result element types must match")]
+    ElementTypeMismatch,
+    #[error(
+        "ReshapeOp: number of dynamic dimension operands ({got}) must match \
+        number of dynamic dimensions in result type ({expected})"
+    )]
+    DynDimCountMismatch { expected: usize, got: usize },
+    #[error("ReshapeOp: all dynamic dimension operands must be of IndexType")]
+    DynDimNotIndex,
+    #[error(
+        "ReshapeOp: total element count of source ({src_count}) must match result ({result_count})"
+    )]
+    ElementCountMismatch {
+        src_count: usize,
+        result_count: usize,
+    },
+}
+
+impl Verify for ReshapeOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        use crate::memref::type_interfaces::Dimension;
+        let loc = self.loc(ctx);
+        let source_ty_ptr = self.get_source(ctx).get_type(ctx);
+        let source_ty_ref = source_ty_ptr.deref(ctx);
+        let source_ty = source_ty_ref
+            .downcast_ref::<RankedTensorType>()
+            .ok_or_else(|| verify_error!(loc.clone(), ReshapeOpVerifyErr::SourceNotRankedTensor))?;
+
+        let result_ty_ptr = self.result_type(ctx);
+        let result_ty_ref = result_ty_ptr.deref(ctx);
+        let result_ty = result_ty_ref
+            .downcast_ref::<RankedTensorType>()
+            .expect("AllResultsOfType<RankedTensorType> ensures result is RankedTensorType");
+
+        if source_ty.element_type() != result_ty.element_type() {
+            return verify_err!(loc, ReshapeOpVerifyErr::ElementTypeMismatch);
+        }
+
+        let dyn_dims = self.get_dynamic_dimensions(ctx);
+        let num_dynamic_in_result = result_ty
+            .shape()
+            .iter()
+            .filter(|d| matches!(d, Dimension::Dynamic))
+            .count();
+
+        if dyn_dims.len() != num_dynamic_in_result {
+            return verify_err!(
+                loc,
+                ReshapeOpVerifyErr::DynDimCountMismatch {
+                    expected: num_dynamic_in_result,
+                    got: dyn_dims.len()
+                }
+            );
+        }
+
+        for dyn_dim in &dyn_dims {
+            if !dyn_dim.get_type(ctx).deref(ctx).is::<IndexType>() {
+                return verify_err!(loc, ReshapeOpVerifyErr::DynDimNotIndex);
+            }
+        }
+
+        // If both shapes are fully static, verify element count equality.
+        let source_shape = source_ty.shape();
+        let result_shape = result_ty.shape();
+        if source_shape
+            .iter()
+            .all(|d| matches!(d, Dimension::Static(_)))
+            && result_shape
+                .iter()
+                .all(|d| matches!(d, Dimension::Static(_)))
+        {
+            let source_count: usize = source_shape
+                .iter()
+                .map(|d| match d {
+                    Dimension::Static(s) => *s,
+                    _ => unreachable!(),
+                })
+                .product();
+            let result_count: usize = result_shape
+                .iter()
+                .map(|d| match d {
+                    Dimension::Static(s) => *s,
+                    _ => unreachable!(),
+                })
+                .product();
+            if source_count != result_count {
+                return verify_err!(
+                    loc,
+                    ReshapeOpVerifyErr::ElementCountMismatch {
+                        src_count: source_count,
+                        result_count
+                    }
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl ReshapeOp {
+    /// Create a new `ReshapeOp`.
+    pub fn new(
+        ctx: &mut Context,
+        source: Value,
+        dynamic_dimensions: Vec<Value>,
+        result_type: TypePtr<RankedTensorType>,
+    ) -> Self {
+        let mut operands = vec![source];
+        operands.extend(dynamic_dimensions);
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![result_type.into()],
+            operands,
+            vec![],
+            0,
+        );
+        Self { op }
+    }
+
+    /// Get the source tensor operand.
+    pub fn get_source(&self, ctx: &Context) -> Value {
+        self.get_operation().deref(ctx).get_operand(0)
+    }
+
+    /// Get the dynamic dimension operands.
+    pub fn get_dynamic_dimensions(&self, ctx: &Context) -> Vec<Value> {
+        self.get_operation().deref(ctx).operands().skip(1).collect()
     }
 }
