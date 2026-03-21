@@ -4,7 +4,7 @@ use pliron::{
     builtin::ops::ModuleOp,
     combine::Parser,
     context::Context,
-    input_error_noloc,
+    init_env_logger, input_error_noloc,
     irbuild::dialect_conversion::apply_dialect_conversion,
     irfmt::parsers::spaced,
     location,
@@ -23,13 +23,9 @@ use pliron_tensor::{
     tensor::{conversions::TensorToMemref, runtime_utils::TensorDesciptor},
 };
 
-use crate::common::init_env_logger;
-
-mod common;
-
 #[test]
 fn test_tensor_to_memref_conversion() {
-    init_env_logger();
+    init_env_logger!();
     let ctx = &mut Context::new();
 
     let input_ir = r#"
@@ -112,7 +108,7 @@ fn test_tensor_to_memref_conversion() {
 
 #[test]
 fn test_int_tensor_from_rust() {
-    init_env_logger();
+    init_env_logger!();
     let ctx = &mut Context::default();
 
     let input_ir = r#"
@@ -270,7 +266,7 @@ fn test_matmul_all_dynamic_from_rust() {
 }
 
 fn test_int_tensor_matmul_from_rust(input_ir: &str) {
-    init_env_logger();
+    init_env_logger!();
     let ctx = &mut Context::default();
 
     let state_stream = state_stream_from_iterator(
@@ -363,7 +359,7 @@ fn test_int_tensor_matmul_from_rust(input_ir: &str) {
 
 #[test]
 fn test_float_tensor_from_rust() {
-    init_env_logger();
+    init_env_logger!();
     let ctx = &mut Context::default();
 
     let input_ir = r#"
@@ -473,7 +469,7 @@ fn test_float_tensor_from_rust() {
 
 #[test]
 fn test_float_tensor_all_binary_ops_from_rust() {
-    init_env_logger();
+    init_env_logger!();
     let ctx = &mut Context::default();
 
     let input_ir = r#"
@@ -591,7 +587,7 @@ fn test_float_tensor_all_binary_ops_from_rust() {
 /// by the TensorToMemref conversion pass.
 #[test]
 fn test_extract_slice_tensor_to_memref() {
-    init_env_logger();
+    init_env_logger!();
     let ctx = &mut Context::new();
 
     let input_ir = r#"
@@ -639,7 +635,7 @@ fn test_extract_slice_tensor_to_memref() {
 /// tensor dialect slice insertion behind.
 #[test]
 fn test_insert_slice_tensor_to_memref() {
-    init_env_logger();
+    init_env_logger!();
     let ctx = &mut Context::new();
 
     let input_ir = r#"

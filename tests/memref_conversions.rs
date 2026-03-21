@@ -1,12 +1,10 @@
 //! Test conversions of memref operations to CF / LLVM dialect.
 
-pub mod common;
-
 use pliron::{
     builtin::ops::ModuleOp,
     combine::Parser,
     context::Context,
-    input_error_noloc,
+    init_env_logger, input_error_noloc,
     irbuild::dialect_conversion::apply_dialect_conversion,
     irfmt::parsers::spaced,
     location,
@@ -273,7 +271,7 @@ fn test_alloc_generate() {
 /// Expected: `dst[i][j] = src[i][1 + j] = i*3 + j + 1`.
 #[test]
 fn test_extract_slice() {
-    common::init_env_logger();
+    init_env_logger!();
     let ctx = &mut Context::new();
 
     let input_ir = r#"
@@ -356,7 +354,7 @@ fn test_extract_slice() {
 /// Then inserts `src` into `dst` at offsets [1, 1], writing the final result into `res`.
 #[test]
 fn test_insert_slice() {
-    common::init_env_logger();
+    init_env_logger!();
     let ctx = &mut Context::new();
 
     let input_ir = r#"
