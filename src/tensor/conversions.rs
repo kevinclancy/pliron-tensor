@@ -9,7 +9,7 @@ use pliron::{
     context::{Context, Ptr},
     derive::{op_interface_impl, type_interface_impl},
     irbuild::{
-        dialect_conversion::{DialectConversion, DialectConversionRewriter, OperandConversionInfo},
+        dialect_conversion::{DialectConversion, DialectConversionRewriter, OperandsInfo},
         inserter::{BlockInsertionPoint, Inserter},
         rewriter::Rewriter,
     },
@@ -548,7 +548,7 @@ impl DialectConversion for TensorToMemref {
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
         op: Ptr<Operation>,
-        _operand_info: &[OperandConversionInfo],
+        _operands_info: &OperandsInfo,
     ) -> Result<()> {
         if let Some(func_op) = Operation::get_op::<FuncOp>(op, ctx) {
             return lower_func_op_to_llvm(&func_op, ctx);

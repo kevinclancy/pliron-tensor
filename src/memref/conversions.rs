@@ -13,7 +13,7 @@ use pliron::{
     derive::{op_interface_impl, type_interface_impl},
     input_error,
     irbuild::{
-        dialect_conversion::{DialectConversion, DialectConversionRewriter, OperandConversionInfo},
+        dialect_conversion::{DialectConversion, DialectConversionRewriter, OperandsInfo},
         inserter::{BlockInsertionPoint, Inserter, OpInsertionPoint},
         listener::Recorder,
         rewriter::{IRRewriter, Rewriter, ScopedRewriter},
@@ -79,7 +79,7 @@ impl ToCFDialect for AllocOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operand_info: &[OperandConversionInfo],
+        _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let result_ty = self.result_type(ctx);
         let memref_ty = TypePtr::<RankedMemrefType>::from_ptr(result_ty, ctx)
@@ -157,7 +157,7 @@ impl ToCFDialect for GenerateOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operand_info: &[OperandConversionInfo],
+        _operands_info: &OperandsInfo,
     ) -> Result<()> {
         // Compute the loop upper bounds based on the memref operand.
         let sizes = descriptor::unpack_sizes(ctx, rewriter, self.get_destination_memref(ctx));
@@ -247,7 +247,7 @@ impl ToCFDialect for StoreOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operand_info: &[OperandConversionInfo],
+        _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let value = self.get_value(ctx);
         let memref = self.get_destination_memref(ctx);
@@ -270,7 +270,7 @@ impl ToCFDialect for LoadOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _operand_info: &[OperandConversionInfo],
+        _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let memref = self.get_source_memref(ctx);
         let elem_ty = self.get_result(ctx).get_type(ctx);
@@ -284,12 +284,18 @@ impl ToCFDialect for LoadOp {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ElementWiseBinaryMemrefOpConversionErr {
+    #[error("Expected memref operand type not found among the previous types of the operand")]
+    ExpectedMemrefTypeNotFound,
+}
+
 trait ElementWiseBinaryMemrefOpToCF: ElementWiseBinaryMemrefOpInterface {
     fn rewrite(
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        operand_info: &[OperandConversionInfo],
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
         // Compute the loop upper bounds based on the memref operand.
         let sizes = descriptor::unpack_sizes(ctx, rewriter, self.get_result_memref(ctx));
@@ -313,22 +319,15 @@ trait ElementWiseBinaryMemrefOpToCF: ElementWiseBinaryMemrefOpInterface {
                 elem_ty: Ptr<TypeObj>,
             }
             let memref_result = self.get_result_memref(ctx);
-            let element_ty = {
-                let tys = &operand_info
-                    .iter()
-                    .find(|info| info.operand == memref_result)
-                    .expect("Expected to find operand info for the result memref")
-                    .previous_types;
-                // Find the most recently seen type that is a RankedMemrefType among the previous types of the memref.
-                tys
-                    .iter()
-                    .rev()
-                    .find_map(|ty| {
-                        let ty_ref = ty.deref(ctx);
-                        ty_ref.downcast_ref::<RankedMemrefType>().map(|t| t.element_type())
-                    })
-                    .expect("Expected to find a RankedMemrefType among the previous types of the memref")
-            };
+            let element_ty = operands_info
+                .lookup_most_recent_of_type::<RankedMemrefType>(ctx, memref_result)
+                .ok_or_else(|| {
+                    input_error!(
+                        self.loc(ctx),
+                        ElementWiseBinaryMemrefOpConversionErr::ExpectedMemrefTypeNotFound
+                    )
+                })?
+                .element_type();
             let mut state = State {
                 rewriter: scoped_rewriter,
                 memref_result: self.get_result_memref(ctx),
@@ -410,9 +409,9 @@ impl ToCFDialect for AddOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        operand_info: &[OperandConversionInfo],
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
-        <Self as ElementWiseBinaryMemrefOpToCF>::rewrite(self, ctx, rewriter, operand_info)
+        <Self as ElementWiseBinaryMemrefOpToCF>::rewrite(self, ctx, rewriter, operands_info)
     }
 }
 
@@ -448,9 +447,9 @@ impl ToCFDialect for SubOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        operand_info: &[OperandConversionInfo],
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
-        <Self as ElementWiseBinaryMemrefOpToCF>::rewrite(self, ctx, rewriter, operand_info)
+        <Self as ElementWiseBinaryMemrefOpToCF>::rewrite(self, ctx, rewriter, operands_info)
     }
 }
 
@@ -486,9 +485,9 @@ impl ToCFDialect for MemrefMulOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        operand_info: &[OperandConversionInfo],
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
-        <Self as ElementWiseBinaryMemrefOpToCF>::rewrite(self, ctx, rewriter, operand_info)
+        <Self as ElementWiseBinaryMemrefOpToCF>::rewrite(self, ctx, rewriter, operands_info)
     }
 }
 
@@ -532,10 +531,16 @@ impl ToCFDialect for DivOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        operand_info: &[OperandConversionInfo],
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
-        <Self as ElementWiseBinaryMemrefOpToCF>::rewrite(self, ctx, rewriter, operand_info)
+        <Self as ElementWiseBinaryMemrefOpToCF>::rewrite(self, ctx, rewriter, operands_info)
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MemrefMatMulOpConversionErr {
+    #[error("Expected memref operand type not found among the previous types of the operand")]
+    ExpectedMemrefTypeNotFound,
 }
 
 // Lowering for memref::MatMulOp -> two nested NDForOps:
@@ -548,29 +553,22 @@ impl ToCFDialect for MemrefMatMulOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        operand_info: &[OperandConversionInfo],
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
         let memref_res = self.get_result_memref(ctx);
         let memref_lhs = self.get_lhs_memref(ctx);
         let memref_rhs = self.get_rhs_memref(ctx);
 
         // Recover the element type from before the memref descriptor conversion.
-        let element_ty = {
-            let tys = &operand_info
-                .iter()
-                .find(|info| info.operand == memref_res)
-                .expect("Expected to find operand info for the result memref")
-                .previous_types;
-            tys.iter()
-                .rev()
-                .find_map(|ty| {
-                    let ty_ref = ty.deref(ctx);
-                    ty_ref
-                        .downcast_ref::<RankedMemrefType>()
-                        .map(|t| t.element_type())
-                })
-                .expect("Expected a RankedMemrefType in the previous types of the result memref")
-        };
+        let element_ty = operands_info
+            .lookup_most_recent_of_type::<RankedMemrefType>(ctx, memref_res)
+            .ok_or_else(|| {
+                input_error!(
+                    self.loc(ctx),
+                    MemrefMatMulOpConversionErr::ExpectedMemrefTypeNotFound
+                )
+            })?
+            .element_type();
 
         // Unpack loop bounds: M, N from res sizes; K from lhs dim 1.
         let res_sizes = descriptor::unpack_sizes(ctx, rewriter, memref_res);
@@ -747,10 +745,10 @@ pub enum ExtractSliceOpConversionErr {
 
 #[derive(Debug, thiserror::Error)]
 pub enum InsertSliceOpConversionErr {
-    #[error("Missing operand info for memref.insert_slice source operand")]
-    MissingSourceOperandInfo,
     #[error("No RankedMemrefType found in source operand's previous types")]
     NoRankedMemrefTypeForSource,
+    #[error("No RankedMemrefType found in destination operand's previous types")]
+    NoRankedMemrefTypeForDestination,
     #[error("Missing insert_slice_params attribute on memref.insert_slice")]
     MissingSliceParams,
 }
@@ -765,38 +763,21 @@ impl ToCFDialect for ExtractSliceOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        operand_info: &[OperandConversionInfo],
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
         let destination = self.destination(ctx);
         let source = self.source(ctx);
 
         // Recover the element type from the source operand's original RankedMemrefType.
-        let element_ty = {
-            let tys = &operand_info
-                .iter()
-                .find(|info| info.operand == source)
-                .ok_or_else(|| {
-                    input_error!(
-                        self.loc(ctx),
-                        ExtractSliceOpConversionErr::MissingSourceOperandInfo
-                    )
-                })?
-                .previous_types;
-            tys.iter()
-                .rev()
-                .find_map(|ty| {
-                    let ty_ref = ty.deref(ctx);
-                    ty_ref
-                        .downcast_ref::<RankedMemrefType>()
-                        .map(|t| t.element_type())
-                })
-                .ok_or_else(|| {
-                    input_error!(
-                        self.loc(ctx),
-                        ExtractSliceOpConversionErr::NoRankedMemrefTypeForSource
-                    )
-                })?
-        };
+        let element_ty = operands_info
+            .lookup_most_recent_of_type::<RankedMemrefType>(ctx, source)
+            .ok_or_else(|| {
+                input_error!(
+                    self.loc(ctx),
+                    ExtractSliceOpConversionErr::MissingSourceOperandInfo
+                )
+            })?
+            .element_type();
 
         let rank = self
             .get_attr_slice_params(ctx)
@@ -962,38 +943,21 @@ impl ToCFDialect for InsertSliceOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        operand_info: &[OperandConversionInfo],
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
         let result_memref = self.result_memref(ctx);
         let source = self.source(ctx);
         let destination = self.destination(ctx);
 
-        let element_ty = {
-            let tys = &operand_info
-                .iter()
-                .find(|info| info.operand == source)
-                .ok_or_else(|| {
-                    input_error!(
-                        self.loc(ctx),
-                        InsertSliceOpConversionErr::MissingSourceOperandInfo
-                    )
-                })?
-                .previous_types;
-            tys.iter()
-                .rev()
-                .find_map(|ty| {
-                    let ty_ref = ty.deref(ctx);
-                    ty_ref
-                        .downcast_ref::<RankedMemrefType>()
-                        .map(|t| t.element_type())
-                })
-                .ok_or_else(|| {
-                    input_error!(
-                        self.loc(ctx),
-                        InsertSliceOpConversionErr::NoRankedMemrefTypeForSource
-                    )
-                })?
-        };
+        let element_ty = operands_info
+            .lookup_most_recent_of_type::<RankedMemrefType>(ctx, source)
+            .ok_or_else(|| {
+                input_error!(
+                    self.loc(ctx),
+                    InsertSliceOpConversionErr::NoRankedMemrefTypeForSource
+                )
+            })?
+            .element_type();
 
         let rank = self
             .get_attr_memref_insert_slice_params(ctx)
@@ -1006,23 +970,16 @@ impl ToCFDialect for InsertSliceOp {
             .offsets
             .len();
 
-        let destination_shape = operand_info
-            .iter()
-            .find(|info| info.operand == destination)
-            .and_then(|info| {
-                info.previous_types.iter().rev().find_map(|ty| {
-                    let ty_ref = ty.deref(ctx);
-                    ty_ref
-                        .downcast_ref::<RankedMemrefType>()
-                        .map(|t| t.shape().clone())
-                })
-            })
+        let destination_shape = operands_info
+            .lookup_most_recent_of_type::<RankedMemrefType>(ctx, destination)
             .ok_or_else(|| {
                 input_error!(
                     self.loc(ctx),
-                    InsertSliceOpConversionErr::NoRankedMemrefTypeForSource
+                    InsertSliceOpConversionErr::NoRankedMemrefTypeForDestination
                 )
-            })?;
+            })?
+            .shape()
+            .clone();
 
         fn to_i64(ctx: &mut Context, rewriter: &mut impl Rewriter<Recorder>, v: Value) -> Value {
             let i64_ty: Ptr<TypeObj> = IntegerType::get(ctx, 64, Signedness::Signless).into();
@@ -1310,6 +1267,12 @@ fn lower_llvm_load_op_to_llvm(
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ReshapeOpConversionErr {
+    #[error("No RankedMemrefType found in previous types of destination memref operand")]
+    NoRankedMemrefTypeForDestination,
+}
+
 // Replace [ReshapeOp] with a 1-D flat copy loop that copies all elements from
 // the source memref into the pre-allocated destination memref, treating both as
 // contiguous row-major arrays.  Because both source and destination are contiguous
@@ -1323,29 +1286,22 @@ impl ToCFDialect for ReshapeOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        operand_info: &[OperandConversionInfo],
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
         let destination = self.get_destination(ctx);
         let source = self.get_source(ctx);
 
-        // Recover element type from operand_info (types may have been converted
+        // Recover element type from operands_info (types may have been converted
         // to LLVM structs by the time CF lowering runs).
-        let element_ty = {
-            let tys = &operand_info
-                .iter()
-                .find(|info| info.operand == source)
-                .expect("Expected to find operand info for the source memref")
-                .previous_types;
-            tys.iter()
-                .rev()
-                .find_map(|ty| {
-                    let ty_ref = ty.deref(ctx);
-                    ty_ref
-                        .downcast_ref::<RankedMemrefType>()
-                        .map(|t| t.element_type())
-                })
-                .expect("Expected a RankedMemrefType in the previous types of the source memref")
-        };
+        let element_ty = operands_info
+            .lookup_most_recent_of_type::<RankedMemrefType>(ctx, destination)
+            .ok_or_else(|| {
+                input_error!(
+                    self.loc(ctx),
+                    ReshapeOpConversionErr::NoRankedMemrefTypeForDestination
+                )
+            })?
+            .element_type();
 
         // Compute total element count from the destination's sizes.
         let dst_sizes = descriptor::unpack_sizes(ctx, rewriter, destination);
@@ -1484,7 +1440,7 @@ impl DialectConversion for MemrefToCF {
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
         op: Ptr<Operation>,
-        operand_info: &[OperandConversionInfo],
+        operands_info: &OperandsInfo,
     ) -> Result<()> {
         if let Some(func_op) = Operation::get_op::<FuncOp>(op, ctx) {
             return lower_func_op_to_llvm(&func_op, ctx);
@@ -1495,6 +1451,6 @@ impl DialectConversion for MemrefToCF {
         let op_dyn = Operation::get_op_dyn(op, ctx);
         let to_cf_op =
             op_cast::<dyn ToCFDialect>(&*op_dyn).expect("Matched Op must implement ToCFDialect");
-        to_cf_op.rewrite(ctx, rewriter, operand_info)
+        to_cf_op.rewrite(ctx, rewriter, operands_info)
     }
 }
