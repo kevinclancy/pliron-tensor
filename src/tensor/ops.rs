@@ -6,7 +6,7 @@ use pliron::{
     builtin::op_interfaces::{
         AllOperandsOfType, AllResultsOfType, AtLeastNOpdsInterface, NOpdsInterface,
         NRegionsInterface, NResultsInterface, OneRegionInterface, OneResultInterface,
-        OperandSegmentInterface, SingleBlockRegionInterface,
+        OperandNOfType, OperandSegmentInterface, ResultNOfType, SingleBlockRegionInterface,
     },
     combine::{
         Parser,
@@ -195,7 +195,12 @@ impl GenerateOp {
 /// | `result` | The extracted element, with the same type as the element type of the operand tensor. |
 #[pliron_op(
     name = "tensor.extract",
-    interfaces = [OneResultInterface, NResultsInterface<1>, OperandSegmentInterface]
+    interfaces = [
+        OneResultInterface,
+        NResultsInterface<1>,
+        OperandSegmentInterface,
+        OperandNOfType<0, RankedTensorType>
+    ],
 )]
 pub struct ExtractOp;
 
@@ -283,10 +288,6 @@ impl ExtractOp {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractOpVerifyErr {
-    #[error("ExtractOp must have at least one operand")]
-    NoOperands,
-    #[error("The first operand of ExtractOp must be a RankedTensorType")]
-    FirstOperandNotTensor,
     #[error("The result type of ExtractOp must match the element type of the operand tensor")]
     ResultTypeMismatch,
     #[error("The number of operands must match the rank of the operand tensor")]
@@ -300,15 +301,11 @@ impl Verify for ExtractOp {
         let loc = self.loc(ctx);
         let op_ref = self.get_operation().deref(ctx);
         let mut operand_tys = op_ref.operands().map(|opd| opd.get_type(ctx));
-
-        let Some(tensor_operand_ty) = operand_tys.next() else {
-            return verify_err!(loc, ExtractOpVerifyErr::NoOperands);
-        };
-
+        let tensor_operand_ty = operand_tys.next().expect("Must have at least one operand");
         let tensor_operand_ty_ref = tensor_operand_ty.deref(ctx);
         let ranked_tensor_ty = tensor_operand_ty_ref
             .downcast_ref::<RankedTensorType>()
-            .ok_or_else(|| verify_error!(loc.clone(), ExtractOpVerifyErr::FirstOperandNotTensor))?;
+            .expect("The first operand must be a ranked tensor type");
         let element_ty = ranked_tensor_ty.element_type();
         let result_ty = self.result_type(ctx);
         if result_ty != element_ty {
@@ -756,6 +753,7 @@ impl MatMulOp {
         OneResultInterface,
         NResultsInterface<1>,
         AllResultsOfType<RankedTensorType>,
+        OperandNOfType<0, RankedTensorType>,
     ],
     attributes = (tensor_slice_params: SliceParamsAttr)
 )]
@@ -836,10 +834,6 @@ impl Parsable for ExtractSliceOp {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractSliceOpVerifyErr {
-    #[error("ExtractSliceOp must have at least one operand (the source tensor)")]
-    NoOperands,
-    #[error("The first operand of ExtractSliceOp must be a RankedTensorType")]
-    FirstOperandNotTensor,
     #[error(
         "The result type of ExtractSliceOp must be a RankedTensorType with same rank as source"
     )]
@@ -876,17 +870,15 @@ impl Verify for ExtractSliceOp {
         let op_ref = self.get_operation().deref(ctx);
         let mut operands = op_ref.operands();
 
-        let Some(source_operand) = operands.next() else {
-            return verify_err!(loc, ExtractSliceOpVerifyErr::NoOperands);
-        };
+        let source_operand = operands
+            .next()
+            .expect("ExtractSliceOp must have at least one operand");
 
         let source_ty_ptr = source_operand.get_type(ctx);
         let source_ty_ref = source_ty_ptr.deref(ctx);
         let source_ty = source_ty_ref
             .downcast_ref::<RankedTensorType>()
-            .ok_or_else(|| {
-                verify_error!(loc.clone(), ExtractSliceOpVerifyErr::FirstOperandNotTensor)
-            })?;
+            .expect("ExtractSliceOp source must be a RankedTensorType");
 
         let rank = source_ty.rank();
 
@@ -895,9 +887,7 @@ impl Verify for ExtractSliceOp {
         let result_ty_ref = result_ty_ptr.deref(ctx);
         let result_ty = result_ty_ref
             .downcast_ref::<RankedTensorType>()
-            .ok_or_else(|| {
-                verify_error!(loc.clone(), ExtractSliceOpVerifyErr::ResultTypeMismatch)
-            })?;
+            .expect("ExtractSliceOp result must be a RankedTensorType");
         if result_ty.rank() != rank {
             return verify_err!(loc, ExtractSliceOpVerifyErr::ResultTypeMismatch);
         }
@@ -1159,12 +1149,30 @@ impl ExtractSliceOp {
 /// Similar to MLIR's
 /// [tensor.insert_slice](https://mlir.llvm.org/docs/Dialects/TensorOps/#tensorinsert_slice-tensorinsertsliceop),
 /// but rank-altering insertion is intentionally not supported here.
+///
+/// ### Operand(s)
+/// | operand | description |
+/// |-----|-------|
+/// | `source` | The source tensor to insert (ranked tensor). |
+/// | `destination` | The destination tensor to insert into (ranked tensor). |
+/// | `dynamic_offsets` | Zero or more [Index](IndexType) operands for dynamic offsets. |
+/// | `dynamic_sizes` | Zero or more [Index](IndexType) operands for dynamic sizes. |
+/// | `dynamic_steps` | Zero or more [Index](IndexType) operands for dynamic steps. |
+///
+/// ### Result(s)
+/// | result | description |
+/// |-----|-------|
+/// | `result` | The resulting tensor after insertion, with same shape as the destination. |
 #[pliron_op(
     name = "tensor.insert_slice",
     interfaces = [
         OneResultInterface,
         NResultsInterface<1>,
         AllResultsOfType<RankedTensorType>,
+        AtLeastNOpdsInterface<2>,
+        ResultNOfType<0, RankedTensorType>,
+        OperandNOfType<0, RankedTensorType>,
+        OperandNOfType<1, RankedTensorType>,
     ],
     attributes = (insert_slice_params: SliceParamsAttr)
 )]
@@ -1254,12 +1262,6 @@ impl Parsable for InsertSliceOp {
 
 #[derive(Debug, thiserror::Error)]
 pub enum InsertSliceOpVerifyErr {
-    #[error("InsertSliceOp must have at least two operands (the source and destination tensors)")]
-    NotEnoughOperands,
-    #[error("The first operand of InsertSliceOp must be a RankedTensorType source")]
-    FirstOperandNotSourceTensor,
-    #[error("The second operand of InsertSliceOp must be a RankedTensorType destination")]
-    SecondOperandNotDestinationTensor,
     #[error("InsertSliceOp source and destination tensors must have the same rank")]
     SourceDestinationRankMismatch,
     #[error("InsertSliceOp source, destination, and result element types must match")]
@@ -1306,34 +1308,24 @@ impl Verify for InsertSliceOp {
         let op_ref = self.get_operation().deref(ctx);
         let mut operands = op_ref.operands();
 
-        let Some(source_operand) = operands.next() else {
-            return verify_err!(loc, InsertSliceOpVerifyErr::NotEnoughOperands);
-        };
-        let Some(destination_operand) = operands.next() else {
-            return verify_err!(loc, InsertSliceOpVerifyErr::NotEnoughOperands);
-        };
+        let source_operand = operands
+            .next()
+            .expect("InsertSliceOp must have at least two operands");
+        let destination_operand = operands
+            .next()
+            .expect("InsertSliceOp must have at least two operands");
 
         let source_ty_ptr = source_operand.get_type(ctx);
         let source_ty_ref = source_ty_ptr.deref(ctx);
         let source_ty = source_ty_ref
             .downcast_ref::<RankedTensorType>()
-            .ok_or_else(|| {
-                verify_error!(
-                    loc.clone(),
-                    InsertSliceOpVerifyErr::FirstOperandNotSourceTensor
-                )
-            })?;
+            .expect("InsertSliceOp source must be a RankedTensorType");
 
         let destination_ty_ptr = destination_operand.get_type(ctx);
         let destination_ty_ref = destination_ty_ptr.deref(ctx);
         let destination_ty = destination_ty_ref
             .downcast_ref::<RankedTensorType>()
-            .ok_or_else(|| {
-                verify_error!(
-                    loc.clone(),
-                    InsertSliceOpVerifyErr::SecondOperandNotDestinationTensor
-                )
-            })?;
+            .expect("InsertSliceOp destination must be a RankedTensorType");
 
         let rank = source_ty.rank();
         if destination_ty.rank() != rank {

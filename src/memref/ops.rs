@@ -6,8 +6,8 @@ use pliron::{
     builtin::op_interfaces::{
         AllOperandsOfType, AllResultsOfType, AtLeastNOpdsInterface, AtLeastNResultsInterface,
         IsTerminatorInterface, NOpdsInterface, NRegionsInterface, NResultsInterface,
-        OneOpdInterface, OneRegionInterface, OneResultInterface, OperandSegmentInterface,
-        SameOperandsType, SameResultsType, SingleBlockRegionInterface,
+        OneOpdInterface, OneRegionInterface, OneResultInterface, OperandNOfType,
+        OperandSegmentInterface, SameOperandsType, SameResultsType, SingleBlockRegionInterface,
     },
     combine::{
         Parser, attempt,
@@ -284,6 +284,7 @@ impl YieldOp {
     interfaces = [
         NResultsInterface<0>,
         AtLeastNOpdsInterface<3>,
+        OperandNOfType<1, RankedMemrefType>,
         OperandSegmentInterface,
     ]
 )]
@@ -369,8 +370,6 @@ impl StoreOp {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreOpVerifyError {
-    #[error("The second operand must be a ranked memref type")]
-    SecondOperandNotRankedMemrefType,
     #[error("The first operand must be of the same type as the memref's element type")]
     FirstOperandNotSameTypeAsMemrefElementType,
     #[error(
@@ -392,10 +391,7 @@ impl Verify for StoreOp {
         let memref_ty = memref.get_type(ctx).deref(ctx);
         let memref_ty = memref_ty
             .downcast_ref::<RankedMemrefType>()
-            .ok_or(verify_error!(
-                loc.clone(),
-                StoreOpVerifyError::SecondOperandNotRankedMemrefType
-            ))?;
+            .expect("The second operand must be a ranked memref type");
 
         if value.get_type(ctx) != memref_ty.element_type() {
             return verify_err!(
@@ -441,6 +437,7 @@ impl Verify for StoreOp {
         NResultsInterface<1>,
         OneResultInterface,
         AtLeastNOpdsInterface<2>,
+        OperandNOfType<0, RankedMemrefType>,
         OperandSegmentInterface,
     ],
 )]
@@ -493,8 +490,6 @@ impl Parsable for LoadOp {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadOpVerifyErr {
-    #[error("The first operand must be a ranked memref type")]
-    FirstOperandNotRankedMemrefType,
     #[error(
         "The number of index operands must match the rank of the memref (expected {expected}, got {got})"
     )]
@@ -516,10 +511,7 @@ impl Verify for LoadOp {
         let memref_ty = memref.get_type(ctx).deref(ctx);
         let memref_ty = memref_ty
             .downcast_ref::<RankedMemrefType>()
-            .ok_or(verify_error!(
-                loc.clone(),
-                LoadOpVerifyErr::FirstOperandNotRankedMemrefType
-            ))?;
+            .expect("The first operand must be a ranked memref type");
 
         if result_ty != memref_ty.element_type() {
             return verify_err!(loc, LoadOpVerifyErr::ResultTypeNotSameAsMemrefElementType);
@@ -880,7 +872,12 @@ impl Parsable for SliceParam {
 /// | `dynamic_steps` | Zero or more [Index](IndexType) operands for dynamic steps. |
 #[pliron_op(
     name = "memref.extract_slice",
-    interfaces = [NResultsInterface<0>],
+    interfaces = [
+        NResultsInterface<0>,
+        OperandNOfType<0, RankedMemrefType>,
+        OperandNOfType<1, RankedMemrefType>,
+        AtLeastNOpdsInterface<2>,
+    ],
     attributes = (slice_params: SliceParamsAttr)
 )]
 pub struct ExtractSliceOp;
@@ -965,12 +962,6 @@ impl Parsable for ExtractSliceOp {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractSliceOpVerifyErr {
-    #[error("ExtractSliceOp must have at least two operands (destination and source memrefs)")]
-    NotEnoughOperands,
-    #[error("The first operand of ExtractSliceOp must be a RankedMemrefType destination")]
-    FirstOperandNotDestinationMemref,
-    #[error("The second operand of ExtractSliceOp must be a RankedMemrefType source")]
-    SecondOperandNotSourceMemref,
     #[error("ExtractSliceOp destination and source ranks must match")]
     DestinationSourceRankMismatch,
     #[error(
@@ -1005,34 +996,20 @@ impl Verify for ExtractSliceOp {
         let op_ref = self.get_operation().deref(ctx);
         let mut operands = op_ref.operands();
 
-        let Some(destination_operand) = operands.next() else {
-            return verify_err!(loc, ExtractSliceOpVerifyErr::NotEnoughOperands);
-        };
-        let Some(source_operand) = operands.next() else {
-            return verify_err!(loc, ExtractSliceOpVerifyErr::NotEnoughOperands);
-        };
+        let destination_operand = operands.next().expect("Expected destination operand");
+        let source_operand = operands.next().expect("Expected source operand");
 
         let destination_ty_ptr = destination_operand.get_type(ctx);
         let destination_ty_ref = destination_ty_ptr.deref(ctx);
         let destination_ty = destination_ty_ref
             .downcast_ref::<RankedMemrefType>()
-            .ok_or_else(|| {
-                verify_error!(
-                    loc.clone(),
-                    ExtractSliceOpVerifyErr::FirstOperandNotDestinationMemref
-                )
-            })?;
+            .expect("Expected destination operand to be ranked memref type");
 
         let source_ty_ptr = source_operand.get_type(ctx);
         let source_ty_ref = source_ty_ptr.deref(ctx);
         let source_ty = source_ty_ref
             .downcast_ref::<RankedMemrefType>()
-            .ok_or_else(|| {
-                verify_error!(
-                    loc.clone(),
-                    ExtractSliceOpVerifyErr::SecondOperandNotSourceMemref
-                )
-            })?;
+            .expect("Expected source operand to be ranked memref type");
 
         let rank = source_ty.rank();
         if destination_ty.rank() != rank {
@@ -1239,9 +1216,26 @@ impl ExtractSliceOp {
 ///
 /// This operation copies the destination memref into the result memref and then inserts
 /// the source memref into the slice described by offsets, sizes, and strides.
+///
+///
+/// ### Operand(s)
+/// | operand | description |
+/// |-----|-------|
+/// | `result` | The resulting memref after insertion (ranked memref). |
+/// | `source` | The source memref to insert (ranked memref). |
+/// | `destination` | The destination memref to insert into (ranked memref). |
+/// | `dynamic_offsets` | Zero or more [Index](IndexType) operands for dynamic offsets. |
+/// | `dynamic_sizes` | Zero or more [Index](IndexType) operands for dynamic sizes. |
+/// | `dynamic_steps` | Zero or more [Index](IndexType) operands for dynamic steps. |
+///
 #[pliron_op(
     name = "memref.insert_slice",
-    interfaces = [NResultsInterface<0>],
+    interfaces = [
+        NResultsInterface<0>,
+        OperandNOfType<0, RankedMemrefType>,
+        OperandNOfType<1, RankedMemrefType>,
+        OperandNOfType<2, RankedMemrefType>
+    ],
     attributes = (memref_insert_slice_params: SliceParamsAttr)
 )]
 pub struct InsertSliceOp;
@@ -1330,16 +1324,6 @@ impl Parsable for InsertSliceOp {
 
 #[derive(Debug, thiserror::Error)]
 pub enum InsertSliceOpVerifyErr {
-    #[error(
-        "InsertSliceOp must have at least three operands (result, source, destination memrefs)"
-    )]
-    NotEnoughOperands,
-    #[error("The first operand of InsertSliceOp must be a RankedMemrefType result")]
-    FirstOperandNotResultMemref,
-    #[error("The second operand of InsertSliceOp must be a RankedMemrefType source")]
-    SecondOperandNotSourceMemref,
-    #[error("The third operand of InsertSliceOp must be a RankedMemrefType destination")]
-    ThirdOperandNotDestinationMemref,
     #[error("InsertSliceOp source, destination, and result memrefs must have the same rank")]
     RankMismatch,
     #[error("InsertSliceOp source, destination, and result element types must match")]
@@ -1386,48 +1370,27 @@ impl Verify for InsertSliceOp {
         let op_ref = self.get_operation().deref(ctx);
         let mut operands = op_ref.operands();
 
-        let Some(result_operand) = operands.next() else {
-            return verify_err!(loc, InsertSliceOpVerifyErr::NotEnoughOperands);
-        };
-        let Some(source_operand) = operands.next() else {
-            return verify_err!(loc, InsertSliceOpVerifyErr::NotEnoughOperands);
-        };
-        let Some(destination_operand) = operands.next() else {
-            return verify_err!(loc, InsertSliceOpVerifyErr::NotEnoughOperands);
-        };
+        let result_operand = operands.next().expect("Missing result operand");
+        let source_operand = operands.next().expect("Missing source operand");
+        let destination_operand = operands.next().expect("Missing destination operand");
 
         let result_ty_ptr = result_operand.get_type(ctx);
         let result_ty_ref = result_ty_ptr.deref(ctx);
         let result_ty = result_ty_ref
             .downcast_ref::<RankedMemrefType>()
-            .ok_or_else(|| {
-                verify_error!(
-                    loc.clone(),
-                    InsertSliceOpVerifyErr::FirstOperandNotResultMemref
-                )
-            })?;
+            .expect("Expected result operand to be a RankedMemrefType");
 
         let source_ty_ptr = source_operand.get_type(ctx);
         let source_ty_ref = source_ty_ptr.deref(ctx);
         let source_ty = source_ty_ref
             .downcast_ref::<RankedMemrefType>()
-            .ok_or_else(|| {
-                verify_error!(
-                    loc.clone(),
-                    InsertSliceOpVerifyErr::SecondOperandNotSourceMemref
-                )
-            })?;
+            .expect("Expected source operand to be a RankedMemrefType");
 
         let destination_ty_ptr = destination_operand.get_type(ctx);
         let destination_ty_ref = destination_ty_ptr.deref(ctx);
         let destination_ty = destination_ty_ref
             .downcast_ref::<RankedMemrefType>()
-            .ok_or_else(|| {
-                verify_error!(
-                    loc.clone(),
-                    InsertSliceOpVerifyErr::ThirdOperandNotDestinationMemref
-                )
-            })?;
+            .expect("Expected destination operand to be a RankedMemrefType");
 
         let rank = source_ty.rank();
         if result_ty.rank() != rank || destination_ty.rank() != rank {
