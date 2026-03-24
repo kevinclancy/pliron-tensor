@@ -29,8 +29,9 @@ use crate::{
         self, ToMemrefDialect, ToMemrefType, ToMemrefTypeFn, descriptor,
         op_interfaces::ElementWiseBinaryMemrefOpInterface,
         ops::{
-            AllocOp, ExtractSliceOp as MemrefExtractSliceOp, InsertSliceOp as MemrefInsertSliceOp,
-            MatMulOp as MemrefMatMulOp, ReshapeOp as MemrefReshapeOp, YieldOp,
+            AllocOp, CopyOp as MemrefCopyOp, InsertSliceOp as MemrefInsertSliceOp,
+            MatMulOp as MemrefMatMulOp, ReshapeOp as MemrefReshapeOp, SubviewOp as MemrefSubviewOp,
+            YieldOp,
         },
         type_interfaces::{Dimension, MultiDimensionalType, ShapedType},
         types::RankedMemrefType,
@@ -397,7 +398,7 @@ fn lower_func_op_to_llvm(func_op: &FuncOp, ctx: &mut Context) -> Result<()> {
     Ok(())
 }
 
-// Lowering for tensor::ExtractSliceOp -> memref::ExtractSliceOp
+// Lowering for tensor::ExtractSliceOp -> memref.alloc + memref.subview + memref.copy
 #[op_interface_impl]
 impl ToMemrefDialect for TensorExtractSliceOp {
     fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
@@ -414,15 +415,9 @@ impl ToMemrefDialect for TensorExtractSliceOp {
             .expect("Expected the converted type to be a RankedMemrefType");
 
         let source = self.source(ctx);
-        let offsets = self
-            .slice_offsets(ctx)
-            .expect("ExtractSliceOp must have slice params");
-        let sizes = self
-            .slice_sizes(ctx)
-            .expect("ExtractSliceOp must have slice params");
-        let steps = self
-            .slice_steps(ctx)
-            .expect("ExtractSliceOp must have slice params");
+        let offsets = self.slice_offsets(ctx);
+        let sizes = self.slice_sizes(ctx);
+        let steps = self.slice_steps(ctx);
 
         let dynamic_dim_operands = sizes
             .iter()
@@ -435,15 +430,12 @@ impl ToMemrefDialect for TensorExtractSliceOp {
         let destination = AllocOp::new(ctx, result_ty, dynamic_dim_operands);
         rewriter.append_op(ctx, destination);
 
-        let memref_op = MemrefExtractSliceOp::new(
-            ctx,
-            destination.get_result(ctx),
-            source,
-            offsets,
-            sizes,
-            steps,
-        );
-        rewriter.append_op(ctx, memref_op);
+        let subview =
+            MemrefSubviewOp::new_with_result_type(ctx, source, offsets, sizes, steps, result_ty);
+        rewriter.append_op(ctx, subview);
+
+        let copy = MemrefCopyOp::new(ctx, destination.get_result(ctx), subview.get_result(ctx));
+        rewriter.append_op(ctx, copy);
         rewriter.replace_operation(ctx, self.get_operation(), destination.get_operation());
         Ok(())
     }
@@ -488,12 +480,9 @@ impl ToMemrefDialect for TensorInsertSliceOp {
             alloc.get_result(ctx),
             source,
             destination,
-            self.slice_offsets(ctx)
-                .expect("InsertSliceOp must have slice params"),
-            self.slice_sizes(ctx)
-                .expect("InsertSliceOp must have slice params"),
-            self.slice_steps(ctx)
-                .expect("InsertSliceOp must have slice params"),
+            self.slice_offsets(ctx),
+            self.slice_sizes(ctx),
+            self.slice_steps(ctx),
         );
         rewriter.append_op(ctx, memref_op);
         rewriter.replace_operation(ctx, self.get_operation(), alloc.get_operation());

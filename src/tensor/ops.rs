@@ -769,27 +769,25 @@ impl Printable for ExtractSliceOp {
         let source = self.source(ctx);
         write!(f, "{} {}", Self::get_opid_static(), source.disp(ctx))?;
 
-        if let (Some(offsets), Some(sizes), Some(steps)) = (
-            self.slice_offsets(ctx),
-            self.slice_sizes(ctx),
-            self.slice_steps(ctx),
-        ) {
-            write!(
-                f,
-                "{}",
-                list_with_sep(&offsets, ListSeparator::CharSpace(',')).disp(ctx)
-            )?;
-            write!(
-                f,
-                "{}",
-                list_with_sep(&sizes, ListSeparator::CharSpace(',')).disp(ctx)
-            )?;
-            write!(
-                f,
-                "{}",
-                list_with_sep(&steps, ListSeparator::CharSpace(',')).disp(ctx)
-            )?;
-        }
+        let offsets = self.slice_offsets(ctx);
+        let sizes = self.slice_sizes(ctx);
+        let steps = self.slice_steps(ctx);
+
+        write!(
+            f,
+            " [{}]",
+            list_with_sep(&offsets, ListSeparator::CharSpace(',')).disp(ctx)
+        )?;
+        write!(
+            f,
+            " [{}]",
+            list_with_sep(&sizes, ListSeparator::CharSpace(',')).disp(ctx)
+        )?;
+        write!(
+            f,
+            " [{}]",
+            list_with_sep(&steps, ListSeparator::CharSpace(',')).disp(ctx)
+        )?;
 
         write!(f, " : {}", self.result_type(ctx).disp(ctx))?;
 
@@ -1116,21 +1114,27 @@ impl ExtractSliceOp {
     }
 
     /// Get the per-dimension offsets as [SliceParam] values.
-    pub fn slice_offsets(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
-        let attrs = self.get_attr_tensor_slice_params(ctx)?;
-        Some(self.slice_attr_to_params(ctx, &attrs.offsets))
+    pub fn slice_offsets(&self, ctx: &Context) -> Vec<SliceParam> {
+        let attrs = self
+            .get_attr_tensor_slice_params(ctx)
+            .expect("Failed to get tensor slice params");
+        self.slice_attr_to_params(ctx, &attrs.offsets)
     }
 
     /// Get the per-dimension sizes as [SliceParam] values.
-    pub fn slice_sizes(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
-        let attrs = self.get_attr_tensor_slice_params(ctx)?;
-        Some(self.slice_attr_to_params(ctx, &attrs.sizes))
+    pub fn slice_sizes(&self, ctx: &Context) -> Vec<SliceParam> {
+        let attrs = self
+            .get_attr_tensor_slice_params(ctx)
+            .expect("Failed to get tensor slice params");
+        self.slice_attr_to_params(ctx, &attrs.sizes)
     }
 
     /// Get the per-dimension steps as [SliceParam] values.
-    pub fn slice_steps(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
-        let attrs = self.get_attr_tensor_slice_params(ctx)?;
-        Some(self.slice_attr_to_params(ctx, &attrs.steps))
+    pub fn slice_steps(&self, ctx: &Context) -> Vec<SliceParam> {
+        let attrs = self
+            .get_attr_tensor_slice_params(ctx)
+            .expect("Failed to get tensor slice params");
+        self.slice_attr_to_params(ctx, &attrs.steps)
     }
 
     /// Get all dynamic operands (excluding the source tensor).
@@ -1195,27 +1199,25 @@ impl Printable for InsertSliceOp {
             destination.disp(ctx)
         )?;
 
-        if let (Some(offsets), Some(sizes), Some(steps)) = (
-            self.slice_offsets(ctx),
-            self.slice_sizes(ctx),
-            self.slice_steps(ctx),
-        ) {
-            write!(
-                f,
-                " {}",
-                list_with_sep(&offsets, ListSeparator::CharSpace(',')).disp(ctx)
-            )?;
-            write!(
-                f,
-                " {}",
-                list_with_sep(&sizes, ListSeparator::CharSpace(',')).disp(ctx)
-            )?;
-            write!(
-                f,
-                " {}",
-                list_with_sep(&steps, ListSeparator::CharSpace(',')).disp(ctx)
-            )?;
-        }
+        let offsets = self.slice_offsets(ctx);
+        let sizes = self.slice_sizes(ctx);
+        let steps = self.slice_steps(ctx);
+
+        write!(
+            f,
+            " [{}]",
+            list_with_sep(&offsets, ListSeparator::CharSpace(',')).disp(ctx)
+        )?;
+        write!(
+            f,
+            " [{}]",
+            list_with_sep(&sizes, ListSeparator::CharSpace(',')).disp(ctx)
+        )?;
+        write!(
+            f,
+            " [{}]",
+            list_with_sep(&steps, ListSeparator::CharSpace(',')).disp(ctx)
+        )?;
 
         write!(f, " : {}", self.result_type(ctx).disp(ctx))?;
 
@@ -1570,21 +1572,27 @@ impl InsertSliceOp {
     }
 
     /// Get the per-dimension offsets as [SliceParam] values.
-    pub fn slice_offsets(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
-        let attrs = self.get_attr_insert_slice_params(ctx)?;
-        Some(self.slice_attr_to_params(ctx, &attrs.offsets))
+    pub fn slice_offsets(&self, ctx: &Context) -> Vec<SliceParam> {
+        let attrs = self
+            .get_attr_insert_slice_params(ctx)
+            .expect("Failed to get tensor slice params");
+        self.slice_attr_to_params(ctx, &attrs.offsets)
     }
 
     /// Get the per-dimension sizes as [SliceParam] values.
-    pub fn slice_sizes(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
-        let attrs = self.get_attr_insert_slice_params(ctx)?;
-        Some(self.slice_attr_to_params(ctx, &attrs.sizes))
+    pub fn slice_sizes(&self, ctx: &Context) -> Vec<SliceParam> {
+        let attrs = self
+            .get_attr_insert_slice_params(ctx)
+            .expect("Failed to get tensor slice params");
+        self.slice_attr_to_params(ctx, &attrs.sizes)
     }
 
     /// Get the per-dimension steps as [SliceParam] values.
-    pub fn slice_steps(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
-        let attrs = self.get_attr_insert_slice_params(ctx)?;
-        Some(self.slice_attr_to_params(ctx, &attrs.steps))
+    pub fn slice_steps(&self, ctx: &Context) -> Vec<SliceParam> {
+        let attrs = self
+            .get_attr_insert_slice_params(ctx)
+            .expect("Failed to get tensor slice params");
+        self.slice_attr_to_params(ctx, &attrs.steps)
     }
 
     /// Get all dynamic operands (excluding the source and destination tensors).

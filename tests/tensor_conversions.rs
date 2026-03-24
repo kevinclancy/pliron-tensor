@@ -1,5 +1,6 @@
 //! Test conversions of memref operations to Memref -> CF -> LLVM dialect.
 
+use expect_test::expect;
 use pliron::{
     builtin::ops::ModuleOp,
     combine::Parser,
@@ -583,57 +584,230 @@ fn test_float_tensor_all_binary_ops_from_rust() {
     }
 }
 
-/// Test that `tensor.extract_slice` is correctly lowered to `memref.extract_slice`
+/// Test that `tensor.extract_slice` is correctly lowered to `memref.subview`
+/// plus an explicit `memref.copy`
 /// by the TensorToMemref conversion pass.
 #[test]
 fn test_extract_slice_tensor_to_memref() {
     init_env_logger!();
-    let ctx = &mut Context::new();
-
-    let input_ir = r#"
+    // Build and execute a pliron function that extracts a slice from a tensor passed in from Rust,
+    // and writes the slice as an output tensor descriptor so we can validate exact values.
+    let exec_ctx = &mut Context::new();
+    let exec_ir = r#"
                 builtin.module @test_module {
                     ^entry():
-                        llvm.func @test_extract_slice: llvm.func <llvm.void (tensor.ranked<10x20:builtin.integer i64>) variadic = false> [] {
-                            ^entry(src : tensor.ranked<10x20:builtin.integer i64>):
+                        llvm.func @test_extract_slice_runtime: llvm.func <llvm.void (llvm.ptr, llvm.ptr) variadic = false> [] {
+                            ^entry(src_p: llvm.ptr, out_p: llvm.ptr):
+                                src = llvm.load src_p : tensor.ranked<10x20:builtin.integer i64>;
                                 slice = tensor.extract_slice src [0, 2] [5, 10] [1, 2] : tensor.ranked<5x10:builtin.integer i64>;
+                                llvm.store *out_p <- slice;
                                 llvm.return
                         }
                 }
         "#;
 
-    let state_stream = state_stream_from_iterator(
-        input_ir.chars(),
-        parsable::State::new(ctx, location::Source::InMemory),
+    let exec_stream = state_stream_from_iterator(
+        exec_ir.chars(),
+        parsable::State::new(exec_ctx, location::Source::InMemory),
     );
-    let parsed = spaced(Operation::top_level_parser())
-        .parse(state_stream)
+    let exec_parsed = spaced(Operation::top_level_parser())
+        .parse(exec_stream)
         .map(|(op, _)| op)
         .map_err(|err| input_error_noloc!(err));
-    let parsed_op = parsed.expect_ok(ctx);
-    let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
-    log::debug!("pliron module parsed {}", module_op.disp(ctx));
-    verify_op(&module_op, ctx).expect_ok(ctx);
+    let exec_parsed_op = exec_parsed.expect_ok(exec_ctx);
+    let exec_module_op = Operation::get_op::<ModuleOp>(exec_parsed_op, exec_ctx).unwrap();
 
-    apply_dialect_conversion(ctx, &mut TensorToMemref, parsed_op).expect_ok(ctx);
-    log::debug!(
-        "pliron module after TensorToMemref conversion {}",
-        module_op.disp(ctx)
-    );
-    verify_op(&module_op, ctx).expect_ok(ctx);
+    verify_op(&exec_module_op, exec_ctx).expect_ok(exec_ctx);
+    apply_dialect_conversion(exec_ctx, &mut TensorToMemref, exec_parsed_op).expect_ok(exec_ctx);
+    expect![[r#"
+        builtin.module @test_module 
+        {
+          ^entry_block2v1():
+            llvm.func @test_extract_slice_runtime: llvm.func <llvm.void (llvm.ptr , llvm.ptr ) variadic = false>
+              [] 
+            {
+              ^entry_block1v1(src_p_block1v1_arg0: llvm.ptr , out_p_block1v1_arg1: llvm.ptr ):
+                src_op4v1_res0 = llvm.load src_p_block1v1_arg0  : memref.ranked <10x20 : builtin.integer i64> !0;
+                op6v3_res0 = memref.alloc  : memref.ranked <5x10 : builtin.integer i64>;
+                memref.subview src_op4v1_res0 [0, 2] [5, 10] [1, 2] : memref.ranked <5x10 : builtin.integer i64>;
+                memref.copy op6v3_res0 <- op3v3_res0;
+                llvm.store *out_p_block1v1_arg1 <- op6v3_res0  !1;
+                llvm.return  !2
+            } !3
+        }"#]].assert_eq(&exec_module_op.disp(exec_ctx).to_string());
+    apply_dialect_conversion(exec_ctx, &mut MemrefToCF, exec_parsed_op).expect_ok(exec_ctx);
+    apply_dialect_conversion(exec_ctx, &mut CFToLLVM, exec_parsed_op).expect_ok(exec_ctx);
+    verify_op(&exec_module_op, exec_ctx).expect_ok(exec_ctx);
 
-    let printed = format!("{}", module_op.disp(ctx));
+    let llvm_ctx = LLVMContext::default();
+    let llvm_ir = pliron_llvm::to_llvm_ir::convert_module(exec_ctx, &llvm_ctx, exec_module_op)
+        .expect_ok(exec_ctx);
+    llvm_ir
+        .verify()
+        .inspect_err(|e| eprintln!("LLVM-IR verification failed: {}", e))
+        .unwrap();
+
+    initialize_native().expect("Failed to initialize native target for LLVM execution");
+    let jit = LLVMLLJIT::new_with_default_builder().expect("Failed to create LLJIT");
+    jit.add_module(llvm_ir)
+        .expect("Failed to add module to JIT");
+    let symbol_addr = jit
+        .lookup_symbol("test_extract_slice_runtime")
+        .expect("Failed to lookup symbol");
+    assert!(symbol_addr != 0);
+
+    let f =
+        unsafe { std::mem::transmute::<u64, extern "C" fn(*const u8, *mut u8) -> ()>(symbol_addr) };
+
+    let src_data: Vec<u64> = (0..200_u64).collect();
+    let src_descr = TensorDesciptor::new(
+        [10, 20].to_vec(),
+        std::mem::size_of::<u64>(),
+        src_data.as_ptr() as *const u8,
+    );
+    let out_descr = TensorDesciptor::new(
+        [5, 10].to_vec(),
+        std::mem::size_of::<u64>(),
+        std::ptr::null::<u8>(),
+    );
+
+    let mut out_ir_descr = out_descr.build_ir_descriptor();
+    f(
+        src_descr.build_ir_descriptor().as_ptr(),
+        out_ir_descr.as_mut_ptr(),
+    );
+
+    let out_tensor_descr = unsafe {
+        TensorDesciptor::from_ir_descriptor(out_ir_descr.as_ptr(), 2, std::mem::size_of::<u64>())
+    };
+    let out_slice = unsafe {
+        std::slice::from_raw_parts(
+            out_tensor_descr.aligned_ptr() as *const u64,
+            out_tensor_descr.num_elements(),
+        )
+    };
+
+    let mut expected = Vec::with_capacity(5 * 10);
+    for i in 0..5_u64 {
+        for j in 0..10_u64 {
+            // src[i][2 + 2*j] for offsets [0, 2], sizes [5, 10], strides [1, 2].
+            expected.push(i * 20 + 2 + 2 * j);
+        }
+    }
+    assert_eq!(out_slice, expected.as_slice());
+}
+
+/// Test that two sequential `tensor.extract_slice` operations are lowered and
+/// executed correctly end-to-end.
+#[test]
+fn test_extract_slice_tensor_to_memref_sequential() {
+    init_env_logger!();
+    // Build and execute a pliron function that extracts a slice from a tensor and then
+    // extracts another slice from the first slice. The final slice is returned through
+    // an output descriptor so we can validate exact values.
+    let exec_ctx = &mut Context::new();
+    let exec_ir = r#"
+                builtin.module @test_module {
+                    ^entry():
+                        llvm.func @test_extract_slice_runtime_sequential: llvm.func <llvm.void (llvm.ptr, llvm.ptr) variadic = false> [] {
+                            ^entry(src_p: llvm.ptr, out_p: llvm.ptr):
+                                src = llvm.load src_p : tensor.ranked<10x20:builtin.integer i64>;
+                                first = tensor.extract_slice src [1, 2] [6, 8] [1, 2] : tensor.ranked<6x8:builtin.integer i64>;
+                                second = tensor.extract_slice first [1, 1] [3, 4] [2, 2] : tensor.ranked<3x4:builtin.integer i64>;
+                                llvm.store *out_p <- second;
+                                llvm.return
+                        }
+                }
+        "#;
+
+    let exec_stream = state_stream_from_iterator(
+        exec_ir.chars(),
+        parsable::State::new(exec_ctx, location::Source::InMemory),
+    );
+    let exec_parsed = spaced(Operation::top_level_parser())
+        .parse(exec_stream)
+        .map(|(op, _)| op)
+        .map_err(|err| input_error_noloc!(err));
+    let exec_parsed_op = exec_parsed.expect_ok(exec_ctx);
+    let exec_module_op = Operation::get_op::<ModuleOp>(exec_parsed_op, exec_ctx).unwrap();
+
+    verify_op(&exec_module_op, exec_ctx).expect_ok(exec_ctx);
+    apply_dialect_conversion(exec_ctx, &mut TensorToMemref, exec_parsed_op).expect_ok(exec_ctx);
+    let after_tensor_to_memref = format!("{}", exec_module_op.disp(exec_ctx));
     assert!(
-        !printed.contains("tensor.extract_slice"),
-        "tensor.extract_slice should have been lowered"
+        !after_tensor_to_memref.contains("tensor.extract_slice"),
+        "both tensor.extract_slice ops should be lowered by TensorToMemref"
     );
     assert!(
-        printed.contains("memref.extract_slice"),
-        "memref.extract_slice should appear after lowering"
+        after_tensor_to_memref.matches("memref.subview").count() >= 2,
+        "expected at least two memref.subview ops after lowering"
     );
     assert!(
-        printed.contains(" <- "),
-        "destination-style memref.extract_slice syntax should be present"
+        after_tensor_to_memref.matches("memref.copy").count() >= 2,
+        "expected at least two memref.copy ops after lowering"
     );
+
+    apply_dialect_conversion(exec_ctx, &mut MemrefToCF, exec_parsed_op).expect_ok(exec_ctx);
+    apply_dialect_conversion(exec_ctx, &mut CFToLLVM, exec_parsed_op).expect_ok(exec_ctx);
+    verify_op(&exec_module_op, exec_ctx).expect_ok(exec_ctx);
+
+    let llvm_ctx = LLVMContext::default();
+    let llvm_ir = pliron_llvm::to_llvm_ir::convert_module(exec_ctx, &llvm_ctx, exec_module_op)
+        .expect_ok(exec_ctx);
+    llvm_ir
+        .verify()
+        .inspect_err(|e| eprintln!("LLVM-IR verification failed: {}", e))
+        .unwrap();
+
+    initialize_native().expect("Failed to initialize native target for LLVM execution");
+    let jit = LLVMLLJIT::new_with_default_builder().expect("Failed to create LLJIT");
+    jit.add_module(llvm_ir)
+        .expect("Failed to add module to JIT");
+    let symbol_addr = jit
+        .lookup_symbol("test_extract_slice_runtime_sequential")
+        .expect("Failed to lookup symbol");
+    assert!(symbol_addr != 0);
+
+    let f =
+        unsafe { std::mem::transmute::<u64, extern "C" fn(*const u8, *mut u8) -> ()>(symbol_addr) };
+
+    let src_data: Vec<u64> = (0..200_u64).collect();
+    let src_descr = TensorDesciptor::new(
+        [10, 20].to_vec(),
+        std::mem::size_of::<u64>(),
+        src_data.as_ptr() as *const u8,
+    );
+    let out_descr = TensorDesciptor::new(
+        [3, 4].to_vec(),
+        std::mem::size_of::<u64>(),
+        std::ptr::null::<u8>(),
+    );
+
+    let mut out_ir_descr = out_descr.build_ir_descriptor();
+    f(
+        src_descr.build_ir_descriptor().as_ptr(),
+        out_ir_descr.as_mut_ptr(),
+    );
+
+    let out_tensor_descr = unsafe {
+        TensorDesciptor::from_ir_descriptor(out_ir_descr.as_ptr(), 2, std::mem::size_of::<u64>())
+    };
+    let out_slice = unsafe {
+        std::slice::from_raw_parts(
+            out_tensor_descr.aligned_ptr() as *const u64,
+            out_tensor_descr.num_elements(),
+        )
+    };
+
+    let mut expected = Vec::with_capacity(3 * 4);
+    for i in 0..3_u64 {
+        for j in 0..4_u64 {
+            // first[i1, j1] = src[1 + i1, 2 + 2*j1]
+            // second[i, j] = first[1 + 2*i, 1 + 2*j] = src[2 + 2*i, 4 + 4*j]
+            expected.push((2 + 2 * i) * 20 + (4 + 4 * j));
+        }
+    }
+    assert_eq!(out_slice, expected.as_slice());
 }
 
 /// Test that `tensor.insert_slice` is lowered to memref / cf ops without leaving

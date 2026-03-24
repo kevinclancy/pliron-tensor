@@ -53,9 +53,9 @@ use crate::memref::{
     descriptor,
     op_interfaces::ElementWiseBinaryMemrefOpInterface,
     ops::{
-        AddOp, AllocOp, DivOp, ExtractSliceOp, GenerateOp, InsertSliceOp, LoadOp,
+        AddOp, AllocOp, CopyOp, DivOp, GenerateOp, InsertSliceOp, LoadOp,
         MatMulOp as MemrefMatMulOp, MulOp as MemrefMulOp, ReshapeOp, SliceParam, StoreOp, SubOp,
-        YieldOp,
+        SubviewOp, YieldOp,
     },
     type_interfaces::{MultiDimensionalType, ShapedType},
     types::RankedMemrefType,
@@ -734,12 +734,14 @@ impl ToCFDialect for MemrefMatMulOp {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum ExtractSliceOpConversionErr {
-    #[error("Missing operand info for memref.extract_slice source operand")]
+pub enum CopyOpConversionErr {
+    #[error("Missing operand info for memref.copy source operand")]
     MissingSourceOperandInfo,
-    #[error("No RankedMemrefType found in source operand's previous types")]
-    NoRankedMemrefTypeForSource,
-    #[error("Missing slice_params attribute on memref.extract_slice")]
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SubviewOpConversionErr {
+    #[error("Missing memref_subview_slice_params attribute on memref.subview")]
     MissingSliceParams,
 }
 
@@ -753,103 +755,70 @@ pub enum InsertSliceOpConversionErr {
     MissingSliceParams,
 }
 
-// Replace [ExtractSliceOp] with an [NDForOp] that iterates over the destination shape
-// and copies each element from the strided source location into the destination:
-//   for dst_idx in 0..size[dim]:  src_idx[dim] = offset[dim] + dst_idx[dim] * step[dim]
-//     dst[dst_idx] = src[src_idx]
+fn materialize_slice_params(
+    ctx: &mut Context,
+    rewriter: &mut impl Rewriter<Recorder>,
+    params: &[SliceParam],
+) -> Vec<Value> {
+    params
+        .iter()
+        .map(|param| match param {
+            SliceParam::Static(val) => {
+                let op = IndexConstantOp::new(ctx, *val);
+                rewriter.append_op(ctx, op);
+                op.get_result(ctx)
+            }
+            SliceParam::Dynamic(value) => *value,
+        })
+        .collect()
+}
+
+/// Cast the given value to the target type if necessary,
+/// handling index<->integer casts as needed.
+fn cast_value_to_type(
+    ctx: &mut Context,
+    rewriter: &mut impl Rewriter<Recorder>,
+    value: Value,
+    target_ty: Ptr<TypeObj>,
+) -> Value {
+    if value.get_type(ctx) == target_ty {
+        return value;
+    }
+
+    if value.get_type(ctx).deref(ctx).is::<IndexType>() {
+        let cast = IndexToIntegerOp::new(ctx, value, target_ty);
+        rewriter.append_op(ctx, cast);
+        return cast.get_result(ctx);
+    }
+
+    if target_ty.deref(ctx).is::<IndexType>() {
+        let cast = IntegerToIndexOp::new(ctx, value, target_ty);
+        rewriter.append_op(ctx, cast);
+        return cast.get_result(ctx);
+    }
+
+    value
+}
+
 #[op_interface_impl]
-impl ToCFDialect for ExtractSliceOp {
+impl ToCFDialect for CopyOp {
     fn rewrite(
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
         operands_info: &OperandsInfo,
     ) -> Result<()> {
-        let destination = self.destination(ctx);
         let source = self.source(ctx);
+        let destination = self.destination(ctx);
 
-        // Recover the element type from the source operand's original RankedMemrefType.
         let element_ty = operands_info
             .lookup_most_recent_of_type::<RankedMemrefType>(ctx, source)
             .ok_or_else(|| {
-                input_error!(
-                    self.loc(ctx),
-                    ExtractSliceOpConversionErr::MissingSourceOperandInfo
-                )
+                input_error!(self.loc(ctx), CopyOpConversionErr::MissingSourceOperandInfo)
             })?
             .element_type();
-
-        let rank = self
-            .get_attr_slice_params(ctx)
-            .ok_or_else(|| {
-                input_error!(
-                    self.loc(ctx),
-                    ExtractSliceOpConversionErr::MissingSliceParams
-                )
-            })?
-            .offsets
-            .len();
-
-        // Convert an index Value to i64 type if needed.
-        fn to_i64(ctx: &mut Context, rewriter: &mut impl Rewriter<Recorder>, v: Value) -> Value {
-            let i64_ty: Ptr<TypeObj> = IntegerType::get(ctx, 64, Signedness::Signless).into();
-            if v.get_type(ctx).deref(ctx).is::<IndexType>() {
-                let cast = IndexToIntegerOp::new(ctx, v, i64_ty);
-                rewriter.append_op(ctx, cast);
-                cast.get_result(ctx)
-            } else {
-                v
-            }
-        }
-
-        // Convert an i64 Value to index type if needed.
-        fn to_index(ctx: &mut Context, rewriter: &mut impl Rewriter<Recorder>, v: Value) -> Value {
-            if v.get_type(ctx).deref(ctx).is::<IndexType>() {
-                v
-            } else {
-                let cast = IntegerToIndexOp::new(ctx, v, IndexType::get(ctx).into());
-                rewriter.append_op(ctx, cast);
-                cast.get_result(ctx)
-            }
-        }
-
-        // Resolve slice offsets / sizes / steps to SSA Values.
-        let mut offsets = Vec::with_capacity(rank);
-        for p in self.slice_offsets(ctx).expect("Missing slice offsets") {
-            let v = match p {
-                SliceParam::Static(val) => {
-                    let op = IndexConstantOp::new(ctx, val);
-                    rewriter.append_op(ctx, op);
-                    op.get_result(ctx)
-                }
-                SliceParam::Dynamic(v) => v,
-            };
-            offsets.push(v);
-        }
-        let mut sizes = Vec::with_capacity(rank);
-        for p in self.slice_sizes(ctx).expect("Missing slice sizes") {
-            let v = match p {
-                SliceParam::Static(val) => {
-                    let op = IndexConstantOp::new(ctx, val);
-                    rewriter.append_op(ctx, op);
-                    op.get_result(ctx)
-                }
-                SliceParam::Dynamic(v) => v,
-            };
-            sizes.push(v);
-        }
-        let mut steps = Vec::with_capacity(rank);
-        for p in self.slice_steps(ctx).expect("Missing slice steps") {
-            let v = match p {
-                SliceParam::Static(val) => {
-                    let op = IndexConstantOp::new(ctx, val);
-                    rewriter.append_op(ctx, op);
-                    op.get_result(ctx)
-                }
-                SliceParam::Dynamic(v) => v,
-            };
-            steps.push(v);
-        }
+        let sizes = descriptor::unpack_sizes(ctx, rewriter, destination);
+        let rank = sizes.len();
 
         let const_zero = IndexConstantOp::new(ctx, 0);
         let const_one = IndexConstantOp::new(ctx, 1);
@@ -866,16 +835,12 @@ impl ToCFDialect for ExtractSliceOp {
                 rewriter: ScopedRewriter<'a, Recorder, IRRewriter<Recorder>>,
                 memref_dst: Value,
                 memref_src: Value,
-                offsets: Vec<Value>,
-                steps: Vec<Value>,
                 elem_ty: Ptr<TypeObj>,
             }
             let mut state = State {
                 rewriter: scoped_rewriter,
                 memref_dst: destination,
                 memref_src: source,
-                offsets,
-                steps,
                 elem_ty: element_ty,
             };
             NDForOp::new(
@@ -886,40 +851,8 @@ impl ToCFDialect for ExtractSliceOp {
                 |ctx, state, inserter, dst_indices| {
                     let rewriter = &mut state.rewriter;
                     rewriter.set_insertion_point(inserter.get_insertion_point());
-
-                    // Compute src_idx[d] = offset[d] + dst_idx[d] * step[d] for each dim.
-                    let src_indices: Vec<Value> = state
-                        .offsets
-                        .iter()
-                        .zip(state.steps.iter())
-                        .zip(dst_indices.iter())
-                        .map(|((offset, step), dst_idx)| {
-                            // Since we use LLVM dialect for address computation,
-                            // we need to convert indices to i64 for arithmetic and
-                            // convert back to index at the end.
-                            let dst_idx = to_i64(ctx, rewriter, *dst_idx);
-                            let step = to_i64(ctx, rewriter, *step);
-                            let offset = to_i64(ctx, rewriter, *offset);
-                            let product = MulOp::new_with_overflow_flag(
-                                ctx,
-                                dst_idx,
-                                step,
-                                IntegerOverflowFlagsAttr::default(),
-                            );
-                            rewriter.append_op(ctx, product);
-                            let src_idx = pliron_llvm::ops::AddOp::new_with_overflow_flag(
-                                ctx,
-                                offset,
-                                product.get_result(ctx),
-                                IntegerOverflowFlagsAttr::default(),
-                            );
-                            rewriter.append_op(ctx, src_idx);
-                            let src_idx = src_idx.get_result(ctx);
-                            to_index(ctx, rewriter, src_idx)
-                        })
-                        .collect();
-
-                    let load = LoadOp::new(ctx, state.elem_ty, state.memref_src, src_indices);
+                    let load =
+                        LoadOp::new(ctx, state.elem_ty, state.memref_src, dst_indices.clone());
                     rewriter.append_op(ctx, load);
                     let store =
                         StoreOp::new(ctx, load.get_result(ctx), state.memref_dst, dst_indices);
@@ -931,6 +864,95 @@ impl ToCFDialect for ExtractSliceOp {
 
         rewriter.append_op(ctx, ndfor);
         rewriter.replace_operation(ctx, self.get_operation(), ndfor.get_operation());
+        Ok(())
+    }
+}
+
+#[op_interface_impl]
+impl ToCFDialect for SubviewOp {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        let source = self.source(ctx);
+        let result_ty = TypePtr::<RankedMemrefType>::from_ptr(self.result_type(ctx), ctx)
+            .expect("SubviewOp result must be a RankedMemrefType");
+
+        let source_descriptor = descriptor::unpack_descriptor(ctx, rewriter, source);
+        let offset_ty = source_descriptor.offset.get_type(ctx);
+        let size_ty = source_descriptor
+            .sizes
+            .first()
+            .map(|size| size.get_type(ctx))
+            .unwrap_or(offset_ty);
+
+        let offsets = materialize_slice_params(ctx, rewriter, &self.slice_offsets(ctx))
+            .into_iter()
+            .map(|offset| cast_value_to_type(ctx, rewriter, offset, offset_ty))
+            .collect::<Vec<_>>();
+        let sizes = materialize_slice_params(ctx, rewriter, &self.slice_sizes(ctx))
+            .into_iter()
+            .map(|size| cast_value_to_type(ctx, rewriter, size, size_ty))
+            .collect::<Vec<_>>();
+        let steps = materialize_slice_params(ctx, rewriter, &self.slice_steps(ctx))
+            .into_iter()
+            .zip(source_descriptor.strides.iter())
+            .map(|(step, stride)| cast_value_to_type(ctx, rewriter, step, stride.get_type(ctx)))
+            .collect::<Vec<_>>();
+
+        let new_offset = offsets.iter().zip(source_descriptor.strides.iter()).fold(
+            source_descriptor.offset,
+            |current_offset, (offset, stride)| {
+                let scaled_offset = MulOp::new_with_overflow_flag(
+                    ctx,
+                    *offset,
+                    *stride,
+                    IntegerOverflowFlagsAttr::default(),
+                );
+                rewriter.append_op(ctx, scaled_offset);
+                let sum = pliron_llvm::ops::AddOp::new_with_overflow_flag(
+                    ctx,
+                    current_offset,
+                    scaled_offset.get_result(ctx),
+                    IntegerOverflowFlagsAttr::default(),
+                );
+                rewriter.append_op(ctx, sum);
+                sum.get_result(ctx)
+            },
+        );
+
+        let new_strides = source_descriptor
+            .strides
+            .iter()
+            .zip(steps.iter())
+            .map(|(stride, step)| {
+                let new_stride = MulOp::new_with_overflow_flag(
+                    ctx,
+                    *stride,
+                    *step,
+                    IntegerOverflowFlagsAttr::default(),
+                );
+                rewriter.append_op(ctx, new_stride);
+                new_stride.get_result(ctx)
+            })
+            .collect();
+
+        let result_descriptor = descriptor::pack_descriptor(
+            ctx,
+            rewriter,
+            result_ty,
+            descriptor::Descriptor {
+                allocated_ptr: source_descriptor.allocated_ptr,
+                aligned_ptr: source_descriptor.aligned_ptr,
+                offset: new_offset,
+                sizes,
+                strides: new_strides,
+            },
+        )?;
+
+        rewriter.replace_operation_with_values(ctx, self.get_operation(), vec![result_descriptor]);
         Ok(())
     }
 }
@@ -1003,7 +1025,7 @@ impl ToCFDialect for InsertSliceOp {
         }
 
         let mut offsets = Vec::with_capacity(rank);
-        for p in self.slice_offsets(ctx).expect("Missing slice offsets") {
+        for p in self.slice_offsets(ctx) {
             let v = match p {
                 SliceParam::Static(val) => {
                     let op = IndexConstantOp::new(ctx, val);
@@ -1015,7 +1037,7 @@ impl ToCFDialect for InsertSliceOp {
             offsets.push(v);
         }
         let mut sizes = Vec::with_capacity(rank);
-        for p in self.slice_sizes(ctx).expect("Missing slice sizes") {
+        for p in self.slice_sizes(ctx) {
             let v = match p {
                 SliceParam::Static(val) => {
                     let op = IndexConstantOp::new(ctx, val);
@@ -1027,7 +1049,7 @@ impl ToCFDialect for InsertSliceOp {
             sizes.push(v);
         }
         let mut steps = Vec::with_capacity(rank);
-        for p in self.slice_steps(ctx).expect("Missing slice steps") {
+        for p in self.slice_steps(ctx) {
             let v = match p {
                 SliceParam::Static(val) => {
                     let op = IndexConstantOp::new(ctx, val);

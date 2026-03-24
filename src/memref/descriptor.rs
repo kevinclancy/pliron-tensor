@@ -132,6 +132,7 @@ pub fn compute_sizes_strides<L: InsertionListener, I: Inserter<L>>(
     (sizes, strides, total_elements)
 }
 
+/// Represents the fields of a memref descriptor.
 pub struct Descriptor {
     pub allocated_ptr: Value,
     pub aligned_ptr: Value,

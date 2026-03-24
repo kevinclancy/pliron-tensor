@@ -7,7 +7,8 @@ use pliron::{
         AllOperandsOfType, AllResultsOfType, AtLeastNOpdsInterface, AtLeastNResultsInterface,
         IsTerminatorInterface, NOpdsInterface, NRegionsInterface, NResultsInterface,
         OneOpdInterface, OneRegionInterface, OneResultInterface, OperandNOfType,
-        OperandSegmentInterface, SameOperandsType, SameResultsType, SingleBlockRegionInterface,
+        OperandSegmentInterface, ResultNOfType, SameOperandsType, SameResultsType,
+        SingleBlockRegionInterface,
     },
     combine::{
         Parser, attempt,
@@ -856,76 +857,157 @@ impl Parsable for SliceParam {
     }
 }
 
-/// Extract a narrow slice from a memref.
-///
-/// This operation extracts a contiguous slice from a source memref into a
-/// destination memref, specified by offsets, sizes, and strides per dimension.
-/// Each parameter can be static or dynamic.
+/// Copy one memref into another memref of the same logical shape.
 ///
 /// ### Operand(s)
 /// | operand | description |
 /// |-----|-------|
-/// | `destination` | The destination memref to write the slice into (ranked memref). |
-/// | `source` | The source memref to extract from (ranked memref). |
-/// | `dynamic_offsets` | Zero or more [Index](IndexType) operands for dynamic offsets. |
-/// | `dynamic_sizes` | Zero or more [Index](IndexType) operands for dynamic sizes. |
-/// | `dynamic_steps` | Zero or more [Index](IndexType) operands for dynamic steps. |
+/// | `destination` | The destination memref to write into. |
+/// | `source` | The source memref to copy from. |
 #[pliron_op(
-    name = "memref.extract_slice",
+    name = "memref.copy",
+    format = "$0 ` <- ` $1",
     interfaces = [
         NResultsInterface<0>,
-        OperandNOfType<0, RankedMemrefType>,
-        OperandNOfType<1, RankedMemrefType>,
-        AtLeastNOpdsInterface<2>,
+        NOpdsInterface<2>,
+        AllOperandsOfType<RankedMemrefType>,
     ],
-    attributes = (slice_params: SliceParamsAttr)
 )]
-pub struct ExtractSliceOp;
+pub struct CopyOp;
 
-impl Printable for ExtractSliceOp {
-    fn fmt(
-        &self,
-        ctx: &Context,
-        _state: &printable::State,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
+#[derive(Debug, thiserror::Error)]
+pub enum CopyOpVerifyErr {
+    #[error("CopyOp operands must have the same element type")]
+    ElementTypeMismatch,
+    #[error("CopyOp operands must have the same rank")]
+    RankMismatch,
+    #[error("CopyOp operands must have compatible shapes")]
+    IncompatibleShapes,
+}
+
+impl Verify for CopyOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        let loc = self.loc(ctx);
         let destination = self.destination(ctx);
         let source = self.source(ctx);
-        write!(
-            f,
-            "{} {} <- {}",
-            Self::get_opid_static(),
-            destination.disp(ctx),
-            source.disp(ctx)
-        )?;
 
-        if let (Some(offsets), Some(sizes), Some(steps)) = (
-            self.slice_offsets(ctx),
-            self.slice_sizes(ctx),
-            self.slice_steps(ctx),
-        ) {
-            write!(
-                f,
-                " {}",
-                list_with_sep(&offsets, ListSeparator::CharSpace(',')).disp(ctx)
-            )?;
-            write!(
-                f,
-                " {}",
-                list_with_sep(&sizes, ListSeparator::CharSpace(',')).disp(ctx)
-            )?;
-            write!(
-                f,
-                " {}",
-                list_with_sep(&steps, ListSeparator::CharSpace(',')).disp(ctx)
-            )?;
+        let destination_ty_ptr = destination.get_type(ctx);
+        let destination_ty_binding = destination_ty_ptr.deref(ctx);
+        let destination_ty = destination_ty_binding
+            .downcast_ref::<RankedMemrefType>()
+            .expect("CopyOp destination must be ranked memref type");
+        let source_ty_ptr = source.get_type(ctx);
+        let source_ty_binding = source_ty_ptr.deref(ctx);
+        let source_ty = source_ty_binding
+            .downcast_ref::<RankedMemrefType>()
+            .expect("CopyOp source must be ranked memref type");
+
+        if destination_ty.element_type() != source_ty.element_type() {
+            return verify_err!(loc.clone(), CopyOpVerifyErr::ElementTypeMismatch);
+        }
+
+        if destination_ty.rank() != source_ty.rank() {
+            return verify_err!(loc.clone(), CopyOpVerifyErr::RankMismatch);
+        }
+
+        for (dst_dim, src_dim) in destination_ty.shape().iter().zip(source_ty.shape().iter()) {
+            if let (
+                crate::memref::type_interfaces::Dimension::Static(dst),
+                crate::memref::type_interfaces::Dimension::Static(src),
+            ) = (dst_dim, src_dim)
+                && dst != src
+            {
+                return verify_err!(loc, CopyOpVerifyErr::IncompatibleShapes);
+            }
         }
 
         Ok(())
     }
 }
 
-impl Parsable for ExtractSliceOp {
+impl CopyOp {
+    pub fn new(ctx: &mut Context, destination: Value, source: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            vec![destination, source],
+            vec![],
+            0,
+        );
+        Self { op }
+    }
+
+    pub fn destination(&self, ctx: &Context) -> Value {
+        self.get_operation().deref(ctx).get_operand(0)
+    }
+
+    pub fn source(&self, ctx: &Context) -> Value {
+        self.get_operation().deref(ctx).get_operand(1)
+    }
+}
+
+/// Create a view into an existing memref by adjusting offset, sizes, and strides.
+///
+/// ### Operand(s)
+/// | operand | description |
+/// |-----|-------|
+/// | `source` | The source memref to view. |
+/// | `dynamic_offsets` | Zero or more [Index](IndexType) operands for dynamic offsets. |
+/// | `dynamic_sizes` | Zero or more [Index](IndexType) operands for dynamic sizes. |
+/// | `dynamic_steps` | Zero or more [Index](IndexType) operands for dynamic steps. |
+///
+/// ### Result(s)
+/// | result | description |
+/// |-----|-------|
+/// | `result` | The computed subview memref. |
+#[pliron_op(
+    name = "memref.subview",
+    interfaces = [
+        NResultsInterface<1>,
+        OneResultInterface,
+        ResultNOfType<0, RankedMemrefType>,
+        OperandNOfType<0, RankedMemrefType>,
+    ],
+    attributes = (memref_subview_slice_params: SliceParamsAttr)
+)]
+pub struct SubviewOp;
+
+impl Printable for SubviewOp {
+    fn fmt(
+        &self,
+        ctx: &Context,
+        _state: &printable::State,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        let source = self.source(ctx);
+        write!(f, "{} {}", Self::get_opid_static(), source.disp(ctx))?;
+
+        let offsets = self.slice_offsets(ctx);
+        let sizes = self.slice_sizes(ctx);
+        let steps = self.slice_steps(ctx);
+
+        write!(
+            f,
+            " [{}]",
+            list_with_sep(&offsets, ListSeparator::CharSpace(',')).disp(ctx)
+        )?;
+        write!(
+            f,
+            " [{}]",
+            list_with_sep(&sizes, ListSeparator::CharSpace(',')).disp(ctx)
+        )?;
+        write!(
+            f,
+            " [{}]",
+            list_with_sep(&steps, ListSeparator::CharSpace(',')).disp(ctx)
+        )?;
+
+        write!(f, " : {}", self.result_type(ctx).disp(ctx))
+    }
+}
+
+impl Parsable for SubviewOp {
     type Arg = Vec<(Identifier, Location)>;
     type Parsed = OpObj;
 
@@ -933,26 +1015,26 @@ impl Parsable for ExtractSliceOp {
         state_stream: &mut parsable::StateStream<'a>,
         results: Self::Arg,
     ) -> parsable::ParseResult<'a, Self::Parsed> {
-        let (destination, source, offsets, sizes, steps) = (
-            ssa_opd_parser().skip(spaced(char::string("<-"))),
+        let (source, offsets, sizes, steps, result_ty) = (
             ssa_opd_parser().skip(spaces()),
             delimited_list_parser('[', ']', ',', SliceParam::parser(())).skip(spaces()),
             delimited_list_parser('[', ']', ',', SliceParam::parser(())).skip(spaces()),
             delimited_list_parser('[', ']', ',', SliceParam::parser(())),
+            spaced(char::string(":")).with(TypePtr::<RankedMemrefType>::parser(())),
         );
 
-        let ((destination, source, offsets, sizes, steps), _) =
-            (destination, source, offsets, sizes, steps)
+        let ((source, offsets, sizes, steps, result_ty), _) =
+            (source, offsets, sizes, steps, result_ty)
                 .parse_stream(state_stream)
                 .into_result()?;
 
-        let op = ExtractSliceOp::new(
+        let op = SubviewOp::new_with_result_type(
             state_stream.state.ctx,
-            destination,
             source,
             offsets,
             sizes,
             steps,
+            result_ty,
         );
 
         process_parsed_ssa_defs(state_stream, &results, op.get_operation())?;
@@ -961,69 +1043,65 @@ impl Parsable for ExtractSliceOp {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum ExtractSliceOpVerifyErr {
-    #[error("ExtractSliceOp destination and source ranks must match")]
-    DestinationSourceRankMismatch,
-    #[error(
-        "ExtractSliceOp: All dynamic operands must be of IndexType, but operand {index} is {ty}"
-    )]
+pub enum SubviewOpVerifyErr {
+    #[error("SubviewOp result and source ranks must match")]
+    ResultSourceRankMismatch,
+    #[error("SubviewOp: All dynamic operands must be of IndexType, but operand {index} is {ty}")]
     NonIndexOperand { index: usize, ty: String },
     #[error(
-        "ExtractSliceOp: Number of dynamic operands ({got}) does not match number of dynamic parameters ({expected})"
+        "SubviewOp: Number of dynamic operands ({got}) does not match number of dynamic parameters ({expected})"
     )]
     NumDynamicOperandsMismatch { expected: usize, got: usize },
     #[error(
-        "ExtractSliceOp: Number of offsets ({got}) does not match rank of source memref ({expected})"
+        "SubviewOp: Number of offsets ({got}) does not match rank of source memref ({expected})"
     )]
     NumOffsetsMismatch { expected: usize, got: usize },
-    #[error(
-        "ExtractSliceOp: Number of sizes ({got}) does not match rank of source memref ({expected})"
-    )]
+    #[error("SubviewOp: Number of sizes ({got}) does not match rank of source memref ({expected})")]
     NumSizesMismatch { expected: usize, got: usize },
-    #[error(
-        "ExtractSliceOp: Number of steps ({got}) does not match rank of source memref ({expected})"
-    )]
+    #[error("SubviewOp: Number of steps ({got}) does not match rank of source memref ({expected})")]
     NumStepsMismatch { expected: usize, got: usize },
-    #[error("ExtractSliceOp: Missing slice_params attribute")]
+    #[error("SubviewOp: Missing memref_subview_slice_params attribute")]
     MissingSliceParamsAttr,
-    #[error("ExtractSliceOp: Static step values must be non-zero (got 0 at dimension {dim})")]
+    #[error("SubviewOp: Static step values must be non-zero (got 0 at dimension {dim})")]
     InvalidStaticStep { dim: usize },
 }
 
-impl Verify for ExtractSliceOp {
+impl Verify for SubviewOp {
     fn verify(&self, ctx: &Context) -> Result<()> {
         let loc = self.loc(ctx);
         let op_ref = self.get_operation().deref(ctx);
         let mut operands = op_ref.operands();
 
-        let destination_operand = operands.next().expect("Expected destination operand");
-        let source_operand = operands.next().expect("Expected source operand");
-
-        let destination_ty_ptr = destination_operand.get_type(ctx);
-        let destination_ty_ref = destination_ty_ptr.deref(ctx);
-        let destination_ty = destination_ty_ref
-            .downcast_ref::<RankedMemrefType>()
-            .expect("Expected destination operand to be ranked memref type");
+        let source_operand = operands
+            .next()
+            .expect("SubviewOp must have a source operand");
 
         let source_ty_ptr = source_operand.get_type(ctx);
-        let source_ty_ref = source_ty_ptr.deref(ctx);
-        let source_ty = source_ty_ref
+        let source_ty_binding = source_ty_ptr.deref(ctx);
+        let source_ty = source_ty_binding
             .downcast_ref::<RankedMemrefType>()
-            .expect("Expected source operand to be ranked memref type");
+            .expect("SubviewOp source must be ranked memref type");
+        let result_ty_ptr = self.result_type(ctx);
+        let result_ty_binding = result_ty_ptr.deref(ctx);
+        let result_ty = result_ty_binding
+            .downcast_ref::<RankedMemrefType>()
+            .expect("SubviewOp result must be ranked memref type");
 
         let rank = source_ty.rank();
-        if destination_ty.rank() != rank {
-            return verify_err!(loc, ExtractSliceOpVerifyErr::DestinationSourceRankMismatch);
+        if result_ty.rank() != rank {
+            return verify_err!(loc, SubviewOpVerifyErr::ResultSourceRankMismatch);
         }
 
-        let slice_params = self.get_attr_slice_params(ctx).ok_or_else(|| {
-            verify_error!(loc.clone(), ExtractSliceOpVerifyErr::MissingSliceParamsAttr)
-        })?;
+        let slice_params = self
+            .get_attr_memref_subview_slice_params(ctx)
+            .ok_or_else(|| {
+                verify_error!(loc.clone(), SubviewOpVerifyErr::MissingSliceParamsAttr)
+            })?;
 
         if slice_params.offsets.len() != rank {
             return verify_err!(
                 loc,
-                ExtractSliceOpVerifyErr::NumOffsetsMismatch {
+                SubviewOpVerifyErr::NumOffsetsMismatch {
                     expected: rank,
                     got: slice_params.offsets.len()
                 }
@@ -1032,7 +1110,7 @@ impl Verify for ExtractSliceOp {
         if slice_params.sizes.len() != rank {
             return verify_err!(
                 loc,
-                ExtractSliceOpVerifyErr::NumSizesMismatch {
+                SubviewOpVerifyErr::NumSizesMismatch {
                     expected: rank,
                     got: slice_params.sizes.len()
                 }
@@ -1041,7 +1119,7 @@ impl Verify for ExtractSliceOp {
         if slice_params.steps.len() != rank {
             return verify_err!(
                 loc,
-                ExtractSliceOpVerifyErr::NumStepsMismatch {
+                SubviewOpVerifyErr::NumStepsMismatch {
                     expected: rank,
                     got: slice_params.steps.len()
                 }
@@ -1050,7 +1128,7 @@ impl Verify for ExtractSliceOp {
 
         for (dim, step) in slice_params.steps.iter().enumerate() {
             if let SliceParamAttr::Static(0) = step {
-                return verify_err!(loc, ExtractSliceOpVerifyErr::InvalidStaticStep { dim });
+                return verify_err!(loc, SubviewOpVerifyErr::InvalidStaticStep { dim });
             }
         }
 
@@ -1080,8 +1158,8 @@ impl Verify for ExtractSliceOp {
                 let ty_name = format!("{:?}", opd_ty_ref);
                 return verify_err!(
                     loc,
-                    ExtractSliceOpVerifyErr::NonIndexOperand {
-                        index: i + 2,
+                    SubviewOpVerifyErr::NonIndexOperand {
+                        index: i + 1,
                         ty: ty_name
                     }
                 );
@@ -1091,7 +1169,7 @@ impl Verify for ExtractSliceOp {
         if remaining_operands.len() != total_dynamic {
             return verify_err!(
                 loc,
-                ExtractSliceOpVerifyErr::NumDynamicOperandsMismatch {
+                SubviewOpVerifyErr::NumDynamicOperandsMismatch {
                     expected: total_dynamic,
                     got: remaining_operands.len()
                 }
@@ -1102,17 +1180,46 @@ impl Verify for ExtractSliceOp {
     }
 }
 
-impl ExtractSliceOp {
-    /// Create a new destination-style ExtractSliceOp.
+impl SubviewOp {
+    /// Create a new `SubviewOp` with the specified source memref, slice parameters.
+    /// The result type is inferred from the source memref element type and the static sizes.
     pub fn new(
         ctx: &mut Context,
-        destination: Value,
         source: Value,
         offsets: Vec<SliceParam>,
         sizes: Vec<SliceParam>,
         steps: Vec<SliceParam>,
     ) -> Self {
-        let mut operands = vec![destination, source];
+        let source_element_type = source
+            .get_type(ctx)
+            .deref(ctx)
+            .downcast_ref::<RankedMemrefType>()
+            .expect("SubviewOp source must be ranked memref type")
+            .element_type();
+        let result_shape = sizes
+            .iter()
+            .map(|size| match size {
+                SliceParam::Static(size) => {
+                    crate::memref::type_interfaces::Dimension::Static(*size)
+                }
+                SliceParam::Dynamic(_) => crate::memref::type_interfaces::Dimension::Dynamic,
+            })
+            .collect();
+        let result_type = RankedMemrefType::get(ctx, source_element_type, result_shape);
+
+        Self::new_with_result_type(ctx, source, offsets, sizes, steps, result_type)
+    }
+
+    /// Create a new `SubviewOp` with the specified source memref, slice parameters, and explicit result type.
+    pub fn new_with_result_type(
+        ctx: &mut Context,
+        source: Value,
+        offsets: Vec<SliceParam>,
+        sizes: Vec<SliceParam>,
+        steps: Vec<SliceParam>,
+        result_type: TypePtr<RankedMemrefType>,
+    ) -> Self {
+        let mut operands = vec![source];
         let mut offset_attrs = Vec::new();
         let mut size_attrs = Vec::new();
         let mut step_attrs = Vec::new();
@@ -1150,13 +1257,13 @@ impl ExtractSliceOp {
         let op = Operation::new(
             ctx,
             Self::get_concrete_op_info(),
-            vec![],
+            vec![result_type.into()],
             operands,
             vec![],
             0,
         );
         let op = Self { op };
-        op.set_attr_slice_params(
+        op.set_attr_memref_subview_slice_params(
             ctx,
             SliceParamsAttr {
                 offsets: offset_attrs,
@@ -1167,48 +1274,50 @@ impl ExtractSliceOp {
         op
     }
 
-    /// Get the destination memref operand.
-    pub fn destination(&self, ctx: &Context) -> Value {
+    /// Get the source memref operand.
+    pub fn source(&self, ctx: &Context) -> Value {
         self.get_operation().deref(ctx).get_operand(0)
     }
 
-    /// Get the source memref operand.
-    pub fn source(&self, ctx: &Context) -> Value {
-        self.get_operation().deref(ctx).get_operand(1)
-    }
-
+    // Helper function to convert slice parameter attributes into user-facing `SliceParam` values.
     fn slice_attr_to_params(&self, ctx: &Context, attrs: &[SliceParamAttr]) -> Vec<SliceParam> {
         let op_ref = self.get_operation().deref(ctx);
         attrs
             .iter()
-            .map(|a| match a {
+            .map(|attr| match attr {
                 SliceParamAttr::Static(val) => SliceParam::Static(*val),
                 SliceParamAttr::OperandIdx(idx) => SliceParam::Dynamic(op_ref.get_operand(*idx)),
             })
             .collect()
     }
 
-    /// Get the per-dimension offsets as [SliceParam] values.
-    pub fn slice_offsets(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
-        let attrs = self.get_attr_slice_params(ctx)?;
-        Some(self.slice_attr_to_params(ctx, &attrs.offsets))
+    /// Get the slice offsets as user-facing `SliceParam` values.
+    pub fn slice_offsets(&self, ctx: &Context) -> Vec<SliceParam> {
+        let attrs = self
+            .get_attr_memref_subview_slice_params(ctx)
+            .expect("SubviewOp must have memref_subview_slice_params attribute");
+        self.slice_attr_to_params(ctx, &attrs.offsets)
     }
 
-    /// Get the per-dimension sizes as [SliceParam] values.
-    pub fn slice_sizes(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
-        let attrs = self.get_attr_slice_params(ctx)?;
-        Some(self.slice_attr_to_params(ctx, &attrs.sizes))
+    /// Get the slice sizes as user-facing `SliceParam` values.
+    pub fn slice_sizes(&self, ctx: &Context) -> Vec<SliceParam> {
+        let attrs = self
+            .get_attr_memref_subview_slice_params(ctx)
+            .expect("SubviewOp must have memref_subview_slice_params attribute");
+        self.slice_attr_to_params(ctx, &attrs.sizes)
     }
 
-    /// Get the per-dimension steps as [SliceParam] values.
-    pub fn slice_steps(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
-        let attrs = self.get_attr_slice_params(ctx)?;
-        Some(self.slice_attr_to_params(ctx, &attrs.steps))
+    /// Get the slice steps as user-facing `SliceParam` values.
+    pub fn slice_steps(&self, ctx: &Context) -> Vec<SliceParam> {
+        let attrs = self
+            .get_attr_memref_subview_slice_params(ctx)
+            .expect("SubviewOp must have memref_subview_slice_params attribute");
+        self.slice_attr_to_params(ctx, &attrs.steps)
     }
 
-    /// Get all dynamic operands (excluding destination and source memrefs).
+    /// Get the dynamic operand values for the slice parameters, in the order they appear as operands.
     pub fn dynamic_operands(&self, ctx: &Context) -> Vec<Value> {
-        self.get_operation().deref(ctx).operands().skip(2).collect()
+        self.get_operation().deref(ctx).operands().skip(1).collect()
     }
 }
 
@@ -1259,27 +1368,25 @@ impl Printable for InsertSliceOp {
             destination.disp(ctx)
         )?;
 
-        if let (Some(offsets), Some(sizes), Some(steps)) = (
-            self.slice_offsets(ctx),
-            self.slice_sizes(ctx),
-            self.slice_steps(ctx),
-        ) {
-            write!(
-                f,
-                " {}",
-                list_with_sep(&offsets, ListSeparator::CharSpace(',')).disp(ctx)
-            )?;
-            write!(
-                f,
-                " {}",
-                list_with_sep(&sizes, ListSeparator::CharSpace(',')).disp(ctx)
-            )?;
-            write!(
-                f,
-                " {}",
-                list_with_sep(&steps, ListSeparator::CharSpace(',')).disp(ctx)
-            )?;
-        }
+        let offsets = self.slice_offsets(ctx);
+        let sizes = self.slice_sizes(ctx);
+        let steps = self.slice_steps(ctx);
+
+        write!(
+            f,
+            " [{}]",
+            list_with_sep(&offsets, ListSeparator::CharSpace(',')).disp(ctx)
+        )?;
+        write!(
+            f,
+            " [{}]",
+            list_with_sep(&sizes, ListSeparator::CharSpace(',')).disp(ctx)
+        )?;
+        write!(
+            f,
+            " [{}]",
+            list_with_sep(&steps, ListSeparator::CharSpace(',')).disp(ctx)
+        )?;
 
         Ok(())
     }
@@ -1605,19 +1712,25 @@ impl InsertSliceOp {
             .collect()
     }
 
-    pub fn slice_offsets(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
-        let attrs = self.get_attr_memref_insert_slice_params(ctx)?;
-        Some(self.slice_attr_to_params(ctx, &attrs.offsets))
+    pub fn slice_offsets(&self, ctx: &Context) -> Vec<SliceParam> {
+        let attrs = self
+            .get_attr_memref_insert_slice_params(ctx)
+            .expect("InsertSliceOp must have memref_insert_slice_params attribute");
+        self.slice_attr_to_params(ctx, &attrs.offsets)
     }
 
-    pub fn slice_sizes(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
-        let attrs = self.get_attr_memref_insert_slice_params(ctx)?;
-        Some(self.slice_attr_to_params(ctx, &attrs.sizes))
+    pub fn slice_sizes(&self, ctx: &Context) -> Vec<SliceParam> {
+        let attrs = self
+            .get_attr_memref_insert_slice_params(ctx)
+            .expect("InsertSliceOp must have memref_insert_slice_params attribute");
+        self.slice_attr_to_params(ctx, &attrs.sizes)
     }
 
-    pub fn slice_steps(&self, ctx: &Context) -> Option<Vec<SliceParam>> {
-        let attrs = self.get_attr_memref_insert_slice_params(ctx)?;
-        Some(self.slice_attr_to_params(ctx, &attrs.steps))
+    pub fn slice_steps(&self, ctx: &Context) -> Vec<SliceParam> {
+        let attrs = self
+            .get_attr_memref_insert_slice_params(ctx)
+            .expect("InsertSliceOp must have memref_insert_slice_params attribute");
+        self.slice_attr_to_params(ctx, &attrs.steps)
     }
 
     pub fn dynamic_operands(&self, ctx: &Context) -> Vec<Value> {

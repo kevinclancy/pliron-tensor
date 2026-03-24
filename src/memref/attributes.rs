@@ -13,7 +13,7 @@ pub enum SliceParamAttr {
     OperandIdx(usize),
 }
 
-/// Stores the slice parameters (offsets, sizes, steps) for an extract_slice operation.
+/// Stores the slice parameters (offsets, sizes, steps) for slice-like operations.
 /// Each dimension can have static or dynamic offsets, sizes, and steps.
 ///
 /// Prints/parses as: `[offset0, offset1, ...] [size0, size1, ...] [step0, step1, ...]`
