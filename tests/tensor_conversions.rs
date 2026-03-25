@@ -810,8 +810,8 @@ fn test_extract_slice_tensor_to_memref_sequential() {
     assert_eq!(out_slice, expected.as_slice());
 }
 
-/// Test that `tensor.insert_slice` is lowered to memref / cf ops without leaving
-/// tensor dialect slice insertion behind.
+/// Test that `tensor.insert_slice` is lowered and executed correctly end-to-end:
+/// TensorToMemref -> MemrefToCF -> CFToLLVM -> JIT.
 #[test]
 fn test_insert_slice_tensor_to_memref() {
     init_env_logger!();
@@ -820,9 +820,12 @@ fn test_insert_slice_tensor_to_memref() {
     let input_ir = r#"
                 builtin.module @test_module {
                     ^entry():
-                        llvm.func @test_insert_slice: llvm.func <llvm.void (tensor.ranked<5x10:builtin.integer i64>, tensor.ranked<10x20:builtin.integer i64>) variadic = false> [] {
-                            ^entry(src : tensor.ranked<5x10:builtin.integer i64>, dst : tensor.ranked<10x20:builtin.integer i64>):
+                        llvm.func @test_insert_slice_runtime: llvm.func <llvm.void (llvm.ptr, llvm.ptr, llvm.ptr) variadic = false> [] {
+                            ^entry(src_p: llvm.ptr, dst_p: llvm.ptr, out_p: llvm.ptr):
+                                src = llvm.load src_p : tensor.ranked<5x10:builtin.integer i64>;
+                                dst = llvm.load dst_p : tensor.ranked<10x20:builtin.integer i64>;
                                 updated = tensor.insert_slice src into dst [0, 2] [5, 10] [1, 2] : tensor.ranked<10x20:builtin.integer i64>;
+                                llvm.store *out_p <- updated;
                                 llvm.return
                         }
                 }
@@ -838,33 +841,115 @@ fn test_insert_slice_tensor_to_memref() {
         .map_err(|err| input_error_noloc!(err));
     let parsed_op = parsed.expect_ok(ctx);
     let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
-    log::debug!("pliron module parsed {}", module_op.disp(ctx));
     verify_op(&module_op, ctx).expect_ok(ctx);
 
     apply_dialect_conversion(ctx, &mut TensorToMemref, parsed_op).expect_ok(ctx);
-    log::debug!(
-        "pliron module after TensorToMemref conversion {}",
-        module_op.disp(ctx)
-    );
+    let after_tensor_to_memref = format!("{}", module_op.disp(ctx));
+    expect![[r#"
+        builtin.module @test_module 
+        {
+          ^entry_block2v1():
+            llvm.func @test_insert_slice_runtime: llvm.func <llvm.void (llvm.ptr , llvm.ptr , llvm.ptr ) variadic = false>
+              [] 
+            {
+              ^entry_block1v1(src_p_block1v1_arg0: llvm.ptr , dst_p_block1v1_arg1: llvm.ptr , out_p_block1v1_arg2: llvm.ptr ):
+                src_op4v1_res0 = llvm.load src_p_block1v1_arg0  : memref.ranked <5x10 : builtin.integer i64> !0;
+                dst_op6v1_res0 = llvm.load dst_p_block1v1_arg1  : memref.ranked <10x20 : builtin.integer i64> !1;
+                op8v3_res0 = memref.alloc  : memref.ranked <10x20 : builtin.integer i64>;
+                memref.copy op8v3_res0 <- dst_op6v1_res0;
+                memref.subview op8v3_res0 [0, 2] [5, 10] [1, 2] : memref.ranked <5x10 : builtin.integer i64>;
+                memref.copy op3v3_res0 <- src_op4v1_res0;
+                llvm.store *out_p_block1v1_arg2 <- op8v3_res0  !2;
+                llvm.return  !3
+            } !4
+        }"#]].assert_eq(&after_tensor_to_memref);
+
+    apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
+    apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
     verify_op(&module_op, ctx).expect_ok(ctx);
 
-    let printed = format!("{}", module_op.disp(ctx));
-    assert!(
-        !printed.contains("tensor.insert_slice"),
-        "tensor.insert_slice should have been lowered"
+    let llvm_ctx = LLVMContext::default();
+    let llvm_ir = pliron_llvm::to_llvm_ir::convert_module(ctx, &llvm_ctx, module_op).expect_ok(ctx);
+    llvm_ir
+        .verify()
+        .inspect_err(|e| eprintln!("LLVM-IR verification failed: {}", e))
+        .unwrap();
+
+    initialize_native().expect("Failed to initialize native target for LLVM execution");
+    let jit = LLVMLLJIT::new_with_default_builder().expect("Failed to create LLJIT");
+    jit.add_module(llvm_ir)
+        .expect("Failed to add module to JIT");
+    let symbol_addr = jit
+        .lookup_symbol("test_insert_slice_runtime")
+        .expect("Failed to lookup symbol");
+    assert!(symbol_addr != 0);
+
+    let f = unsafe {
+        std::mem::transmute::<u64, extern "C" fn(*const u8, *const u8, *mut u8) -> ()>(symbol_addr)
+    };
+
+    let src_data: Vec<u64> = (100..150_u64).collect();
+    let dst_data: Vec<u64> = (0..200_u64).collect();
+
+    let src_descr = TensorDesciptor::new(
+        [5, 10].to_vec(),
+        std::mem::size_of::<u64>(),
+        src_data.as_ptr() as *const u8,
     );
-    assert!(
-        printed.contains("memref.insert_slice"),
-        "memref.insert_slice should appear after lowering"
+    let dst_descr = TensorDesciptor::new(
+        [10, 20].to_vec(),
+        std::mem::size_of::<u64>(),
+        dst_data.as_ptr() as *const u8,
     );
-    assert!(
-        printed.contains(" <- "),
-        "destination-style memref.insert_slice syntax should be present"
+    let out_descr = TensorDesciptor::new(
+        [10, 20].to_vec(),
+        std::mem::size_of::<u64>(),
+        std::ptr::null::<u8>(),
     );
-    assert!(
-        printed.contains(" into "),
-        "memref.insert_slice syntax should mention the destination memref"
+
+    let mut out_ir_descr = out_descr.build_ir_descriptor();
+    f(
+        src_descr.build_ir_descriptor().as_ptr(),
+        dst_descr.build_ir_descriptor().as_ptr(),
+        out_ir_descr.as_mut_ptr(),
     );
+
+    let out_tensor_descr = unsafe {
+        TensorDesciptor::from_ir_descriptor(out_ir_descr.as_ptr(), 2, std::mem::size_of::<u64>())
+    };
+    let out_slice = unsafe {
+        std::slice::from_raw_parts(
+            out_tensor_descr.aligned_ptr() as *const u64,
+            out_tensor_descr.num_elements(),
+        )
+    };
+
+    let mut expected = dst_data.clone();
+    let mut inserted_positions = vec![false; expected.len()];
+    for i in 0..5_usize {
+        for j in 0..10_usize {
+            let src_idx = i * 10 + j;
+            let dst_idx = i * 20 + (2 + 2 * j);
+            expected[dst_idx] = src_data[src_idx];
+            inserted_positions[dst_idx] = true;
+        }
+    }
+
+    // Validate every destination element: inserted cells must match source,
+    // all other cells must retain original destination data.
+    for idx in 0..expected.len() {
+        if inserted_positions[idx] {
+            assert_eq!(
+                out_slice[idx], expected[idx],
+                "inserted cell mismatch at {idx}"
+            );
+        } else {
+            assert_eq!(
+                out_slice[idx], dst_data[idx],
+                "untouched cell mismatch at {idx}"
+            );
+        }
+    }
 }
 
 /// End-to-end test for tensor.reshape lowering:
@@ -906,14 +991,23 @@ fn test_tensor_reshape_to_memref_cf_from_rust() {
 
     apply_dialect_conversion(ctx, &mut TensorToMemref, parsed_op).expect_ok(ctx);
     let after_tensor_to_memref = format!("{}", module_op.disp(ctx));
-    assert!(
-        !after_tensor_to_memref.contains("tensor.reshape"),
-        "tensor.reshape should be lowered by TensorToMemref"
-    );
-    assert!(
-        after_tensor_to_memref.contains("memref.reshape"),
-        "memref.reshape should appear after TensorToMemref"
-    );
+    expect![[r#"
+        builtin.module @test_module 
+        {
+          ^entry_block2v1():
+            llvm.func @test_tensor_reshape_extract: llvm.func <builtin.integer i64(llvm.ptr , builtin.integer i64, builtin.integer i64) variadic = false>
+              [] 
+            {
+              ^entry_block1v1(arg_p_block1v1_arg0: llvm.ptr , i_res_block1v1_arg1: builtin.integer i64, j_res_block1v1_arg2: builtin.integer i64):
+                arg_op4v1_res0 = llvm.load arg_p_block1v1_arg0  : memref.ranked <2x3 : builtin.integer i64> !0;
+                op8v3_res0 = memref.alloc  : memref.ranked <3x2 : builtin.integer i64>;
+                memref.reshape op8v3_res0 <- arg_op4v1_res0;
+                i_idx_op7v1_res0 = index.from_integer i_res_block1v1_arg1 : index.index  !1;
+                j_idx_op9v1_res0 = index.from_integer j_res_block1v1_arg2 : index.index  !2;
+                memref.load op8v3_res0[i_idx_op7v1_res0, j_idx_op9v1_res0] : builtin.integer i64;
+                llvm.return op5v3_res0 !3
+            } !4
+        }"#]].assert_eq(&after_tensor_to_memref);
 
     apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);

@@ -29,9 +29,8 @@ use crate::{
         self, ToMemrefDialect, ToMemrefType, ToMemrefTypeFn, descriptor,
         op_interfaces::ElementWiseBinaryMemrefOpInterface,
         ops::{
-            AllocOp, CopyOp as MemrefCopyOp, InsertSliceOp as MemrefInsertSliceOp,
-            MatMulOp as MemrefMatMulOp, ReshapeOp as MemrefReshapeOp, SubviewOp as MemrefSubviewOp,
-            YieldOp,
+            AllocOp, CopyOp as MemrefCopyOp, MatMulOp as MemrefMatMulOp,
+            ReshapeOp as MemrefReshapeOp, SubviewOp as MemrefSubviewOp, YieldOp,
         },
         type_interfaces::{Dimension, MultiDimensionalType, ShapedType},
         types::RankedMemrefType,
@@ -475,16 +474,21 @@ impl ToMemrefDialect for TensorInsertSliceOp {
         let alloc = AllocOp::new(ctx, result_ty, dynamic_dim_operands);
         rewriter.append_op(ctx, alloc);
 
-        let memref_op = MemrefInsertSliceOp::new(
+        // Preserve destination values in the new result memref, then overwrite the sliced window.
+        let copy_destination = MemrefCopyOp::new(ctx, alloc.get_result(ctx), destination);
+        rewriter.append_op(ctx, copy_destination);
+
+        let view = MemrefSubviewOp::new(
             ctx,
             alloc.get_result(ctx),
-            source,
-            destination,
             self.slice_offsets(ctx),
             self.slice_sizes(ctx),
             self.slice_steps(ctx),
         );
-        rewriter.append_op(ctx, memref_op);
+        rewriter.append_op(ctx, view);
+
+        let copy_source = MemrefCopyOp::new(ctx, view.get_result(ctx), source);
+        rewriter.append_op(ctx, copy_source);
         rewriter.replace_operation(ctx, self.get_operation(), alloc.get_operation());
         Ok(())
     }

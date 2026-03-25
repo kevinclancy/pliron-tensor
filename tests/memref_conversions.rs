@@ -419,15 +419,19 @@ fn test_copy() {
     }
 }
 
-/// Test that `memref.insert_slice` is correctly lowered to CF / LLVM.
+/// Test that a `memref.copy + memref.subview + memref.copy` insertion sequence
+/// is correctly lowered to CF / LLVM.
 ///
 /// The function initializes:
 /// - `src[i][j] = i*10 + j` for a 2x2 source memref
 /// - `dst[i][j] = 100 + i*4 + j` for a 3x4 destination memref
 ///
-/// Then inserts `src` into `dst` at offsets [1, 1], writing the final result into `res`.
+/// Then inserts `src` into `dst` at offsets [1, 1] by:
+/// - copying `dst` into `res`
+/// - taking `sub = memref.subview res [...]`
+/// - copying `src` into `sub`
 #[test]
-fn test_insert_slice() {
+fn test_insert_slice_sequence() {
     init_env_logger!();
     let ctx = &mut Context::new();
 
@@ -460,7 +464,9 @@ fn test_insert_slice() {
             };
             res = memref.alloc : memref.ranked<3 x 4 : builtin.integer i64>;
             one = index.constant <index.constant 1> : index.index;
-            memref.insert_slice res <- src into dst [one, one] [2, 2] [one, one];
+            memref.copy res <- dst;
+            sub = memref.subview res [one, one] [2, 2] [one, one] : memref.ranked<2 x 2 : builtin.integer i64>;
+            memref.copy sub <- src;
             i_idx = index.from_integer i_arg : index.index;
             j_idx = index.from_integer j_arg : index.index;
             result = memref.load res[i_idx, j_idx]: builtin.integer i64;
