@@ -953,8 +953,8 @@ fn test_insert_slice_tensor_to_memref() {
 }
 
 /// End-to-end test for tensor.reshape lowering:
-/// tensor.reshape -> memref.reshape (TensorToMemref), then
-/// memref.reshape -> cf.for + copy (MemrefToCF), then LLVM.
+/// tensor.reshape -> memref.alloc + memref.copy + memref.reshape (TensorToMemref), then
+/// memref.reshape -> descriptor construction (MemrefToCF), then LLVM.
 #[test]
 fn test_tensor_reshape_to_memref_cf_from_rust() {
     init_env_logger!();
@@ -1000,11 +1000,12 @@ fn test_tensor_reshape_to_memref_cf_from_rust() {
             {
               ^entry_block1v1(arg_p_block1v1_arg0: llvm.ptr , i_res_block1v1_arg1: builtin.integer i64, j_res_block1v1_arg2: builtin.integer i64):
                 arg_op4v1_res0 = llvm.load arg_p_block1v1_arg0  : memref.ranked <2x3 : builtin.integer i64> !0;
-                op8v3_res0 = memref.alloc  : memref.ranked <3x2 : builtin.integer i64>;
-                memref.reshape op8v3_res0 <- arg_op4v1_res0;
+                op8v3_res0 = memref.alloc  : memref.ranked <2x3 : builtin.integer i64>;
+                memref.copy op8v3_res0 <- arg_op4v1_res0;
+                op3v3_res0 = memref.reshape op8v3_res0 : memref.ranked <3x2 : builtin.integer i64>;
                 i_idx_op7v1_res0 = index.from_integer i_res_block1v1_arg1 : index.index  !1;
                 j_idx_op9v1_res0 = index.from_integer j_res_block1v1_arg2 : index.index  !2;
-                memref.load op8v3_res0[i_idx_op7v1_res0, j_idx_op9v1_res0] : builtin.integer i64;
+                memref.load op3v3_res0[i_idx_op7v1_res0, j_idx_op9v1_res0] : builtin.integer i64;
                 llvm.return op5v3_res0 !3
             } !4
         }"#]].assert_eq(&after_tensor_to_memref);

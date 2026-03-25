@@ -28,11 +28,7 @@ use pliron::{
     value::Value,
 };
 use pliron_common_dialects::{
-    cf::{
-        ToCFDialect,
-        op_interfaces::YieldingRegion,
-        ops::{ForOp, NDForOp},
-    },
+    cf::{ToCFDialect, op_interfaces::YieldingRegion, ops::NDForOp},
     index::{
         ops::{IndexConstantOp, IndexToIntegerOp, IntegerToIndexOp},
         types::IndexType,
@@ -46,7 +42,7 @@ use pliron_llvm::{
         BinArithOp, CastOpInterface, FloatBinArithOpWithFastMathFlags,
         IntBinArithOpWithOverflowFlag,
     },
-    ops::{BrOp, CallOp, FuncOp, GepIndex, GetElementPtrOp, MulOp},
+    ops::{BrOp, CallOp, FuncOp, MulOp},
 };
 
 use crate::memref::{
@@ -1046,147 +1042,44 @@ fn lower_llvm_load_op_to_llvm(
     Ok(())
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum ReshapeOpConversionErr {
-    #[error("No RankedMemrefType found in previous types of destination memref operand")]
-    NoRankedMemrefTypeForDestination,
-}
-
-// Replace [ReshapeOp] with a 1-D flat copy loop that copies all elements from
-// the source memref into the pre-allocated destination memref, treating both as
-// contiguous row-major arrays.  Because both source and destination are contiguous
-// (produced by [AllocOp]), element i in linear order is at
-//   aligned_ptr[offset + i]
-// for both operands, so the loop simply does:
-//   for i in [0, num_elems): dst[offset_dst + i] = src[offset_src + i]
+// Replace [ReshapeOp] with descriptor construction over the source storage.
+// The resulting descriptor reuses source allocated/aligned pointers and offset,
+// while recomputing sizes and strides for the new result shape.
 #[op_interface_impl]
 impl ToCFDialect for ReshapeOp {
     fn rewrite(
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
+        _operands_info: &OperandsInfo,
     ) -> Result<()> {
-        let destination = self.get_destination(ctx);
         let source = self.get_source(ctx);
+        let dynamic_dimensions = self.get_dynamic_dimensions(ctx);
 
-        // Recover element type from operands_info (types may have been converted
-        // to LLVM structs by the time CF lowering runs).
-        let element_ty = operands_info
-            .lookup_most_recent_of_type::<RankedMemrefType>(ctx, destination)
-            .ok_or_else(|| {
-                input_error!(
-                    self.loc(ctx),
-                    ReshapeOpConversionErr::NoRankedMemrefTypeForDestination
-                )
-            })?
-            .element_type();
+        let result_memref_ty = TypePtr::<RankedMemrefType>::from_ptr(self.result_type(ctx), ctx)
+            .expect("ReshapeOp result type must be RankedMemrefType");
 
-        // Compute total element count from the destination's sizes.
-        let dst_sizes = descriptor::unpack_sizes(ctx, rewriter, destination);
-        let i64_ty: Ptr<TypeObj> = IntegerType::get(ctx, 64, Signedness::Signless).into();
-        let const_one = IndexConstantOp::new(ctx, 1);
-        rewriter.append_op(ctx, const_one);
-        let const_one_i64 = IndexToIntegerOp::new(ctx, const_one.get_result(ctx), i64_ty);
-        rewriter.append_op(ctx, const_one_i64);
-        let num_elems_i64 = dst_sizes
-            .iter()
-            .fold(const_one_i64.get_result(ctx), |acc, &sz| {
-                let mul = MulOp::new_with_overflow_flag(
-                    ctx,
-                    acc,
-                    sz,
-                    IntegerOverflowFlagsAttr::default(),
-                );
-                rewriter.append_op(ctx, mul);
-                mul.get_result(ctx)
-            });
-        let num_elems = IntegerToIndexOp::new(ctx, num_elems_i64, IndexType::get(ctx).into());
-        rewriter.append_op(ctx, num_elems);
+        let (sizes, strides, _num_elems) =
+            descriptor::compute_sizes_strides(ctx, rewriter, result_memref_ty, dynamic_dimensions);
 
-        // Base pointers at their respective offsets — we add the flat loop index
-        // as a second GEP step inside the loop body.
-        let src_aligned_ptr = descriptor::unpack_aligned_ptr(ctx, rewriter, source);
-        let src_offset = descriptor::unpack_offset(ctx, rewriter, source);
-        let src_base = GetElementPtrOp::new(
+        let allocated_ptr = descriptor::unpack_allocated_ptr(ctx, rewriter, source);
+        let aligned_ptr = descriptor::unpack_aligned_ptr(ctx, rewriter, source);
+        let offset = descriptor::unpack_offset(ctx, rewriter, source);
+
+        let reshaped = descriptor::pack_descriptor(
             ctx,
-            src_aligned_ptr,
-            vec![GepIndex::Value(src_offset)],
-            element_ty,
-        );
-        rewriter.append_op(ctx, src_base);
+            rewriter,
+            result_memref_ty,
+            descriptor::Descriptor {
+                allocated_ptr,
+                aligned_ptr,
+                offset,
+                sizes,
+                strides,
+            },
+        )?;
 
-        let dst_aligned_ptr = descriptor::unpack_aligned_ptr(ctx, rewriter, destination);
-        let dst_offset = descriptor::unpack_offset(ctx, rewriter, destination);
-        let dst_base = GetElementPtrOp::new(
-            ctx,
-            dst_aligned_ptr,
-            vec![GepIndex::Value(dst_offset)],
-            element_ty,
-        );
-        rewriter.append_op(ctx, dst_base);
-
-        let const_zero = IndexConstantOp::new(ctx, 0);
-        let const_step = IndexConstantOp::new(ctx, 1);
-        rewriter.append_op(ctx, const_zero);
-        rewriter.append_op(ctx, const_step);
-
-        let forop = {
-            struct State {
-                src_base: Value,
-                dst_base: Value,
-                elem_ty: Ptr<TypeObj>,
-            }
-            let mut state = State {
-                src_base: src_base.get_result(ctx),
-                dst_base: dst_base.get_result(ctx),
-                elem_ty: element_ty,
-            };
-            ForOp::new(
-                ctx,
-                const_zero.get_result(ctx),
-                num_elems.get_result(ctx),
-                const_step.get_result(ctx),
-                &[],
-                |ctx, state, inserter, i, iter_args| {
-                    assert!(
-                        iter_args.is_empty(),
-                        "ReshapeOp copy loop should not have iter args"
-                    );
-
-                    let src_ptr = GetElementPtrOp::new(
-                        ctx,
-                        state.src_base,
-                        vec![GepIndex::Value(i)],
-                        state.elem_ty,
-                    );
-                    inserter.append_op(ctx, src_ptr);
-                    let load =
-                        pliron_llvm::ops::LoadOp::new(ctx, src_ptr.get_result(ctx), state.elem_ty);
-                    inserter.append_op(ctx, load);
-
-                    let dst_ptr = GetElementPtrOp::new(
-                        ctx,
-                        state.dst_base,
-                        vec![GepIndex::Value(i)],
-                        state.elem_ty,
-                    );
-                    inserter.append_op(ctx, dst_ptr);
-                    let store = pliron_llvm::ops::StoreOp::new(
-                        ctx,
-                        load.get_result(ctx),
-                        dst_ptr.get_result(ctx),
-                    );
-                    inserter.append_op(ctx, store);
-
-                    vec![]
-                },
-                &mut state,
-            )
-        };
-
-        rewriter.append_op(ctx, forop);
-        rewriter.replace_operation(ctx, self.get_operation(), forop.get_operation());
+        rewriter.replace_operation_with_values(ctx, self.get_operation(), vec![reshaped]);
         Ok(())
     }
 }

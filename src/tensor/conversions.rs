@@ -494,11 +494,13 @@ impl ToMemrefDialect for TensorInsertSliceOp {
     }
 }
 
-// Lowering for tensor::ReshapeOp -> memref::ReshapeOp
+// Lowering for tensor::ReshapeOp -> memref.alloc + memref.copy + memref.reshape
 #[op_interface_impl]
 impl ToMemrefDialect for TensorReshapeOp {
     fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
         let source = self.get_source(ctx);
+        let source_memref_ty = TypePtr::<RankedMemrefType>::from_ptr(source.get_type(ctx), ctx)
+            .expect("ReshapeOp source must be a ranked memref after tensor-to-memref conversion");
         let result_ty_ptr = self.get_result(ctx).get_type(ctx);
         let converter = {
             let result_ty_ref = result_ty_ptr.deref(ctx);
@@ -511,18 +513,36 @@ impl ToMemrefDialect for TensorReshapeOp {
         let result_ty = TypePtr::<RankedMemrefType>::from_ptr(result_ty, ctx)
             .expect("Expected the converted type to be a RankedMemrefType");
 
-        // Allocate the destination memref. The dynamic dimensions from the tensor
-        // reshape become the dynamic dimension operands for AllocOp.
-        let dyn_dims = self.get_dynamic_dimensions(ctx);
-        let alloc = AllocOp::new(ctx, result_ty, dyn_dims);
-        rewriter.append_op(ctx, alloc);
+        // Create a contiguous copy of the source first, then reshape that copy by
+        // constructing a descriptor with the target shape.
+        let source_shape = source_memref_ty.deref(ctx).shape().clone();
+        let source_dyn_dims = source_shape
+            .iter()
+            .enumerate()
+            .filter_map(|(i, dim)| {
+                if let Dimension::Dynamic = dim {
+                    Some(descriptor::unpack_size(ctx, rewriter, source, i))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
 
-        // Copy source elements into the freshly allocated destination.
-        let memref_reshape = MemrefReshapeOp::new(ctx, alloc.get_result(ctx), source);
+        let source_copy_alloc = AllocOp::new(ctx, source_memref_ty, source_dyn_dims);
+        rewriter.append_op(ctx, source_copy_alloc);
+
+        let copy_source = MemrefCopyOp::new(ctx, source_copy_alloc.get_result(ctx), source);
+        rewriter.append_op(ctx, copy_source);
+
+        let memref_reshape = MemrefReshapeOp::new(
+            ctx,
+            source_copy_alloc.get_result(ctx),
+            self.get_dynamic_dimensions(ctx),
+            result_ty,
+        );
         rewriter.append_op(ctx, memref_reshape);
 
-        // Replace all uses of the tensor result with the allocated destination.
-        rewriter.replace_operation(ctx, self.get_operation(), alloc.get_operation());
+        rewriter.replace_operation(ctx, self.get_operation(), memref_reshape.get_operation());
         Ok(())
     }
 }

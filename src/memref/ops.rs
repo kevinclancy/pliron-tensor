@@ -1321,36 +1321,48 @@ impl SubviewOp {
     }
 }
 
-/// Reshape a memref to a new shape.
-/// The elements of the source are copied into the destination in row-major
-/// (C contiguous) order. The total number of elements and element type
-/// must be the same for both source and destination.
+/// Reshape a memref to a new shape by creating a new descriptor view over
+/// the same underlying storage.
+///
+/// This operation does not copy elements. The source and result must have the
+/// same element type and total element count.
 ///
 /// ### Operand(s)
 /// | operand | description |
 /// |-----|-------|
-/// | `destination` | The pre-allocated destination ranked memref with the target shape. |
 /// | `source` | The source ranked memref to reshape from. |
+/// | `dynamic_dimensions` | One [Index](IndexType) operand per dynamic dimension in the result type. |
+///
+/// ### Result(s)
+/// | result | description |
+/// |-----|-------|
+/// | `result` | A reshaped ranked memref descriptor that aliases the source storage. |
 #[pliron_op(
     name = "memref.reshape",
-    format = "$0 ` <- ` $1",
+    format = "operands(CharSpace(`,`)) ` : ` type($0)",
     interfaces = [
-        NResultsInterface<0>,
-        NOpdsInterface<2>,
-        AtLeastNOpdsInterface<2>,
-        AllOperandsOfType<RankedMemrefType>,
+        OneResultInterface,
+        NResultsInterface<1>,
+        AtLeastNOpdsInterface<1>,
+        OperandNOfType<0, RankedMemrefType>,
+        AllResultsOfType<RankedMemrefType>,
     ],
 )]
 pub struct ReshapeOp;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReshapeOpVerifyErr {
-    #[error("ReshapeOp destination must be a RankedMemrefType")]
-    DestinationNotRankedMemref,
     #[error("ReshapeOp source must be a RankedMemrefType")]
     SourceNotRankedMemref,
-    #[error("ReshapeOp source and destination element types must match")]
+    #[error("ReshapeOp source and result element types must match")]
     ElementTypeMismatch,
+    #[error(
+        "ReshapeOp: number of dynamic dimension operands ({got}) must match \
+        number of dynamic dimensions in result type ({expected})"
+    )]
+    DynDimCountMismatch { expected: usize, got: usize },
+    #[error("ReshapeOp: all dynamic dimension operands must be of IndexType")]
+    DynDimNotIndex,
     #[error(
         "ReshapeOp: total element count of source ({src_count}) must match destination ({result_count})"
     )]
@@ -1365,27 +1377,48 @@ impl Verify for ReshapeOp {
         use crate::memref::type_interfaces::Dimension;
         let loc = self.loc(ctx);
 
-        let dst_ty_ptr = self.get_destination(ctx).get_type(ctx);
-        let dst_ty_ref = dst_ty_ptr.deref(ctx);
-        let dst_ty = dst_ty_ref
-            .downcast_ref::<RankedMemrefType>()
-            .ok_or_else(|| {
-                verify_error!(loc.clone(), ReshapeOpVerifyErr::DestinationNotRankedMemref)
-            })?;
-
         let src_ty_ptr = self.get_source(ctx).get_type(ctx);
         let src_ty_ref = src_ty_ptr.deref(ctx);
         let src_ty = src_ty_ref
             .downcast_ref::<RankedMemrefType>()
             .ok_or_else(|| verify_error!(loc.clone(), ReshapeOpVerifyErr::SourceNotRankedMemref))?;
 
-        if src_ty.element_type() != dst_ty.element_type() {
+        let result_ty_ptr = self.result_type(ctx);
+        let result_ty_ref = result_ty_ptr.deref(ctx);
+        let result_ty = result_ty_ref
+            .downcast_ref::<RankedMemrefType>()
+            .expect("AllResultsOfType<RankedMemrefType> ensures result is RankedMemrefType");
+
+        if src_ty.element_type() != result_ty.element_type() {
             return verify_err!(loc, ReshapeOpVerifyErr::ElementTypeMismatch);
+        }
+
+        let dyn_dims = self.get_dynamic_dimensions(ctx);
+        let num_dynamic_in_result = result_ty
+            .shape()
+            .iter()
+            .filter(|d| matches!(d, Dimension::Dynamic))
+            .count();
+
+        if dyn_dims.len() != num_dynamic_in_result {
+            return verify_err!(
+                loc.clone(),
+                ReshapeOpVerifyErr::DynDimCountMismatch {
+                    expected: num_dynamic_in_result,
+                    got: dyn_dims.len()
+                }
+            );
+        }
+
+        for dyn_dim in &dyn_dims {
+            if !dyn_dim.get_type(ctx).deref(ctx).is::<IndexType>() {
+                return verify_err!(loc.clone(), ReshapeOpVerifyErr::DynDimNotIndex);
+            }
         }
 
         // If both shapes are fully static, verify element count equality.
         let src_shape = src_ty.shape();
-        let dst_shape = dst_ty.shape();
+        let dst_shape = result_ty.shape();
         if src_shape.iter().all(|d| matches!(d, Dimension::Static(_)))
             && dst_shape.iter().all(|d| matches!(d, Dimension::Static(_)))
         {
@@ -1420,25 +1453,32 @@ impl Verify for ReshapeOp {
 
 impl ReshapeOp {
     /// Create a new `ReshapeOp`.
-    pub fn new(ctx: &mut Context, destination: Value, source: Value) -> Self {
+    pub fn new(
+        ctx: &mut Context,
+        source: Value,
+        dynamic_dimensions: Vec<Value>,
+        result_type: TypePtr<RankedMemrefType>,
+    ) -> Self {
+        let mut operands = vec![source];
+        operands.extend(dynamic_dimensions);
         let op = Operation::new(
             ctx,
             Self::get_concrete_op_info(),
-            vec![],
-            vec![destination, source],
+            vec![result_type.into()],
+            operands,
             vec![],
             0,
         );
         Self { op }
     }
 
-    /// Get the destination memref operand.
-    pub fn get_destination(&self, ctx: &Context) -> Value {
+    /// Get the source memref operand.
+    pub fn get_source(&self, ctx: &Context) -> Value {
         self.get_operation().deref(ctx).get_operand(0)
     }
 
-    /// Get the source memref operand.
-    pub fn get_source(&self, ctx: &Context) -> Value {
-        self.get_operation().deref(ctx).get_operand(1)
+    /// Get the dynamic dimension operands.
+    pub fn get_dynamic_dimensions(&self, ctx: &Context) -> Vec<Value> {
+        self.get_operation().deref(ctx).operands().skip(1).collect()
     }
 }
