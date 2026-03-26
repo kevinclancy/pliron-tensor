@@ -520,6 +520,7 @@ impl DivOp {
 /// | `result` | The product tensor of shape [M, N]. |
 #[pliron_op(
     name = "tensor.matmul",
+    format = "$0 `, ` $1 ` : ` type($0)",
     interfaces = [
         OneResultInterface,
         NResultsInterface<1>,
@@ -529,48 +530,6 @@ impl DivOp {
     ],
 )]
 pub struct MatMulOp;
-
-impl Printable for MatMulOp {
-    fn fmt(
-        &self,
-        ctx: &Context,
-        _state: &printable::State,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
-        let lhs = self.get_operation().deref(ctx).get_operand(0);
-        let rhs = self.get_operation().deref(ctx).get_operand(1);
-        write!(
-            f,
-            "{} {}, {} : {}",
-            Self::get_opid_static(),
-            lhs.disp(ctx),
-            rhs.disp(ctx),
-            self.result_type(ctx).disp(ctx)
-        )
-    }
-}
-
-impl Parsable for MatMulOp {
-    type Arg = Vec<(Identifier, Location)>;
-    type Parsed = OpObj;
-
-    fn parse<'a>(
-        state_stream: &mut parsable::StateStream<'a>,
-        results: Self::Arg,
-    ) -> parsable::ParseResult<'a, Self::Parsed> {
-        let lhs = ssa_opd_parser().skip(spaced(char::string(",")));
-        let rhs = ssa_opd_parser();
-        let res_ty = spaced(char::string(":")).with(Ptr::<TypeObj>::parser(()));
-
-        let ((lhs, rhs, res_ty), _) = (lhs, rhs, res_ty)
-            .parse_stream(state_stream)
-            .into_result()?;
-
-        let op = MatMulOp::new_with_result_type(state_stream.state.ctx, lhs, rhs, res_ty);
-        process_parsed_ssa_defs(state_stream, &results, op.get_operation())?;
-        Ok(OpObj::new(op)).into_parse_result()
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum MatMulOpVerifyErr {
@@ -708,6 +667,219 @@ impl MatMulOp {
     }
 
     /// Create a new [MatMulOp] with an explicitly provided result type.
+    pub fn new_with_result_type(
+        ctx: &mut Context,
+        lhs: Value,
+        rhs: Value,
+        res_ty: Ptr<TypeObj>,
+    ) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![res_ty],
+            vec![lhs, rhs],
+            vec![],
+            0,
+        );
+        Self { op }
+    }
+}
+
+/// Batched matrix multiplication over tensors of rank >= 2.
+///
+/// For operands of shape `[..., M, K]` and `[..., K, N]`, this computes
+/// batched matrix products for each batch index in `...`, producing
+/// a result of shape `[..., M, N]`.
+#[pliron_op(
+    name = "tensor.batch_matmul",
+    format = "$0 `, ` $1 ` : ` type($0)",
+    interfaces = [
+        OneResultInterface,
+        NResultsInterface<1>,
+        NOpdsInterface<2>,
+        AllResultsOfType<RankedTensorType>,
+        AllOperandsOfType<RankedTensorType>,
+    ],
+)]
+pub struct BatchMatMulOp;
+
+#[derive(Debug, thiserror::Error)]
+pub enum BatchMatMulOpVerifyErr {
+    #[error("BatchMatMulOp operands and result must be ranked tensors with rank >= 2")]
+    InvalidRank,
+    #[error("BatchMatMulOp lhs and rhs must have the same rank")]
+    OperandRankMismatch,
+    #[error("BatchMatMulOp operands and result must have the same element type")]
+    ElementTypeMismatch,
+    #[error("BatchMatMulOp batch dim {dim} mismatch: lhs={lhs_d}, rhs={rhs_d}")]
+    BatchDimMismatch {
+        dim: usize,
+        lhs_d: usize,
+        rhs_d: usize,
+    },
+    #[error("BatchMatMulOp lhs K dim ({lhs_k}) must match rhs K dim ({rhs_k})")]
+    InnerDimMismatch { lhs_k: usize, rhs_k: usize },
+    #[error("BatchMatMulOp result dim {dim} (={result_d}) does not match expected {expected}")]
+    ResultDimMismatch {
+        dim: usize,
+        result_d: usize,
+        expected: usize,
+    },
+}
+
+impl Verify for BatchMatMulOp {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        use crate::memref::type_interfaces::Dimension;
+
+        let loc = self.loc(ctx);
+        let op_ref = self.get_operation().deref(ctx);
+        let lhs = op_ref.get_operand(0);
+        let rhs = op_ref.get_operand(1);
+        let result = op_ref.get_result(0);
+
+        let lhs_ty_deref = lhs.get_type(ctx);
+        let rhs_ty_deref = rhs.get_type(ctx);
+        let result_ty_deref = result.get_type(ctx);
+
+        let lhs_binding = lhs_ty_deref.deref(ctx);
+        let lhs_ty = lhs_binding
+            .downcast_ref::<RankedTensorType>()
+            .ok_or_else(|| verify_error!(loc.clone(), BatchMatMulOpVerifyErr::InvalidRank))?;
+        let rhs_binding = rhs_ty_deref.deref(ctx);
+        let rhs_ty = rhs_binding
+            .downcast_ref::<RankedTensorType>()
+            .ok_or_else(|| verify_error!(loc.clone(), BatchMatMulOpVerifyErr::InvalidRank))?;
+        let result_binding = result_ty_deref.deref(ctx);
+        let result_ty = result_binding
+            .downcast_ref::<RankedTensorType>()
+            .ok_or_else(|| verify_error!(loc.clone(), BatchMatMulOpVerifyErr::InvalidRank))?;
+
+        if lhs_ty.rank() < 2 || rhs_ty.rank() < 2 || result_ty.rank() < 2 {
+            return verify_err!(loc, BatchMatMulOpVerifyErr::InvalidRank);
+        }
+        if lhs_ty.rank() != rhs_ty.rank() {
+            return verify_err!(loc, BatchMatMulOpVerifyErr::OperandRankMismatch);
+        }
+        if result_ty.rank() != lhs_ty.rank() {
+            return verify_err!(loc, BatchMatMulOpVerifyErr::InvalidRank);
+        }
+
+        let elem_ty = lhs_ty.element_type();
+        if rhs_ty.element_type() != elem_ty || result_ty.element_type() != elem_ty {
+            return verify_err!(loc, BatchMatMulOpVerifyErr::ElementTypeMismatch);
+        }
+
+        let lhs_shape = lhs_ty.shape();
+        let rhs_shape = rhs_ty.shape();
+        let result_shape = result_ty.shape();
+        let rank = lhs_ty.rank();
+
+        for i in 0..(rank - 2) {
+            if let (Dimension::Static(lhs_d), Dimension::Static(rhs_d)) =
+                (&lhs_shape[i], &rhs_shape[i])
+                && lhs_d != rhs_d
+            {
+                return verify_err!(
+                    loc,
+                    BatchMatMulOpVerifyErr::BatchDimMismatch {
+                        dim: i,
+                        lhs_d: *lhs_d,
+                        rhs_d: *rhs_d
+                    }
+                );
+            }
+            if let (Dimension::Static(lhs_d), Dimension::Static(res_d)) =
+                (&lhs_shape[i], &result_shape[i])
+                && lhs_d != res_d
+            {
+                return verify_err!(
+                    loc,
+                    BatchMatMulOpVerifyErr::ResultDimMismatch {
+                        dim: i,
+                        result_d: *res_d,
+                        expected: *lhs_d
+                    }
+                );
+            }
+        }
+
+        // K: lhs[-1] must match rhs[-2]
+        if let (Dimension::Static(lhs_k), Dimension::Static(rhs_k)) =
+            (&lhs_shape[rank - 1], &rhs_shape[rank - 2])
+            && lhs_k != rhs_k
+        {
+            return verify_err!(
+                loc,
+                BatchMatMulOpVerifyErr::InnerDimMismatch {
+                    lhs_k: *lhs_k,
+                    rhs_k: *rhs_k
+                }
+            );
+        }
+
+        // M: lhs[-2] must match result[-2]
+        if let (Dimension::Static(lhs_m), Dimension::Static(result_m)) =
+            (&lhs_shape[rank - 2], &result_shape[rank - 2])
+            && lhs_m != result_m
+        {
+            return verify_err!(
+                loc,
+                BatchMatMulOpVerifyErr::ResultDimMismatch {
+                    dim: rank - 2,
+                    result_d: *result_m,
+                    expected: *lhs_m
+                }
+            );
+        }
+
+        // N: rhs[-1] must match result[-1]
+        if let (Dimension::Static(rhs_n), Dimension::Static(result_n)) =
+            (&rhs_shape[rank - 1], &result_shape[rank - 1])
+            && rhs_n != result_n
+        {
+            return verify_err!(
+                loc,
+                BatchMatMulOpVerifyErr::ResultDimMismatch {
+                    dim: rank - 1,
+                    result_d: *result_n,
+                    expected: *rhs_n
+                }
+            );
+        }
+
+        Ok(())
+    }
+}
+
+impl BatchMatMulOp {
+    /// Create a new [BatchMatMulOp], inferring the result type from the input shapes.
+    pub fn new(ctx: &mut Context, lhs: Value, rhs: Value) -> Self {
+        let result_ty = {
+            let lhs_ty = lhs.get_type(ctx);
+            let rhs_ty = rhs.get_type(ctx);
+            let (elem_ty, result_shape) = {
+                let lhs_ty_ref = lhs_ty.deref(ctx);
+                let rhs_ty_ref = rhs_ty.deref(ctx);
+                let lhs_ranked = lhs_ty_ref
+                    .downcast_ref::<RankedTensorType>()
+                    .expect("BatchMatMulOp lhs must be a RankedTensorType");
+                let rhs_ranked = rhs_ty_ref
+                    .downcast_ref::<RankedTensorType>()
+                    .expect("BatchMatMulOp rhs must be a RankedTensorType");
+                let rank = lhs_ranked.rank();
+
+                let mut result_shape = lhs_ranked.shape()[..rank - 2].to_vec();
+                result_shape.push(lhs_ranked.shape()[rank - 2].clone());
+                result_shape.push(rhs_ranked.shape()[rank - 1].clone());
+
+                (lhs_ranked.element_type(), result_shape)
+            };
+            RankedTensorType::get(ctx, elem_ty, result_shape)
+        };
+        Self::new_with_result_type(ctx, lhs, rhs, result_ty.into())
+    }
+
+    /// Create a new [BatchMatMulOp] with an explicitly provided result type.
     pub fn new_with_result_type(
         ctx: &mut Context,
         lhs: Value,

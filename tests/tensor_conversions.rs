@@ -359,6 +359,101 @@ fn test_int_tensor_matmul_from_rust(input_ir: &str) {
 }
 
 #[test]
+fn test_batch_matmul_from_rust() {
+    init_env_logger!();
+    let ctx = &mut Context::default();
+
+    let input_ir = r#"
+            builtin.module @test_module {
+              ^entry():
+                llvm.func @test_tensor_batch_matmul: llvm.func <llvm.void (llvm.ptr, llvm.ptr, llvm.ptr) variadic = false> [] {
+                  ^entry(arg1_p: llvm.ptr, arg2_p: llvm.ptr, res_p: llvm.ptr):
+                    arg1 = llvm.load arg1_p : tensor.ranked<2x2x3:builtin.integer i64>;
+                    arg2 = llvm.load arg2_p : tensor.ranked<2x3x2:builtin.integer i64>;
+                    res = tensor.batch_matmul arg1, arg2 : tensor.ranked<2x2x2:builtin.integer i64>;
+                    llvm.store *res_p <- res;
+                    llvm.return
+                }
+            }
+            "#;
+
+    let state_stream = state_stream_from_iterator(
+        input_ir.chars(),
+        parsable::State::new(ctx, location::Source::InMemory),
+    );
+    let parsed = spaced(Operation::top_level_parser())
+        .parse(state_stream)
+        .map(|(op, _)| op)
+        .map_err(|err| input_error_noloc!(err));
+
+    let parsed_op = parsed.expect_ok(ctx);
+    let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    apply_dialect_conversion(ctx, &mut TensorToMemref, parsed_op).expect_ok(ctx);
+    apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
+    apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    let llvm_ctx = LLVMContext::default();
+    let llvm_ir = pliron_llvm::to_llvm_ir::convert_module(ctx, &llvm_ctx, module_op).expect_ok(ctx);
+    llvm_ir.verify().unwrap();
+
+    initialize_native().expect("Failed to initialize native target for LLVM execution");
+    let jit = LLVMLLJIT::new_with_default_builder().expect("Failed to create LLJIT");
+    jit.add_module(llvm_ir)
+        .expect("Failed to add module to JIT");
+    let symbol_addr = jit
+        .lookup_symbol("test_tensor_batch_matmul")
+        .expect("Failed to lookup symbol");
+    assert!(symbol_addr != 0);
+
+    // Batch 0 lhs: [[1,2,3],[4,5,6]], rhs: [[1,2],[3,4],[5,6]]
+    // result: [[22,28],[49,64]]
+    // Batch 1 lhs: [[7,8,9],[10,11,12]], rhs: [[7,8],[9,10],[11,12]]
+    // result: [[220,244],[301,334]]
+    let t1 = TensorDesciptor::new(
+        [2, 2, 3].to_vec(),
+        std::mem::size_of::<u64>(),
+        [1u64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].as_ptr() as *const u8,
+    );
+    let t2 = TensorDesciptor::new(
+        [2, 3, 2].to_vec(),
+        std::mem::size_of::<u64>(),
+        [1u64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].as_ptr() as *const u8,
+    );
+
+    let res_descr = TensorDesciptor::new(
+        [2, 2, 2].to_vec(),
+        std::mem::size_of::<u64>(),
+        std::ptr::null::<u8>(),
+    );
+
+    let f = unsafe {
+        std::mem::transmute::<u64, extern "C" fn(*const u8, *const u8, *mut u8) -> ()>(symbol_addr)
+    };
+
+    let mut res_ir_descr = res_descr.build_ir_descriptor();
+    f(
+        t1.build_ir_descriptor().as_ptr(),
+        t2.build_ir_descriptor().as_ptr(),
+        res_ir_descr.as_mut_ptr(),
+    );
+
+    let res_tensor_descr = unsafe {
+        TensorDesciptor::from_ir_descriptor(res_ir_descr.as_ptr(), 3, std::mem::size_of::<u64>())
+    };
+    let res_slice = unsafe {
+        std::slice::from_raw_parts(
+            res_tensor_descr.aligned_ptr() as *const u64,
+            res_tensor_descr.num_elements(),
+        )
+    };
+
+    assert_eq!(res_slice, &[22u64, 28, 49, 64, 220, 244, 301, 334]);
+}
+
+#[test]
 fn test_float_tensor_from_rust() {
     init_env_logger!();
     let ctx = &mut Context::default();

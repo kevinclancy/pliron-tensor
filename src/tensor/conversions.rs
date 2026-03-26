@@ -10,8 +10,9 @@ use pliron::{
     derive::{op_interface_impl, type_interface_impl},
     irbuild::{
         dialect_conversion::{DialectConversion, DialectConversionRewriter, OperandsInfo},
-        inserter::{BlockInsertionPoint, Inserter},
-        rewriter::Rewriter,
+        inserter::{BlockInsertionPoint, Inserter, OpInsertionPoint},
+        listener::Recorder,
+        rewriter::{IRRewriter, Rewriter, ScopedRewriter},
     },
     linked_list::ContainsLinkedList,
     op::{Op, op_cast, op_impls},
@@ -21,7 +22,10 @@ use pliron::{
     r#type::{TypeObj, TypePtr, Typed, type_cast, type_impls},
     value::Value,
 };
-use pliron_common_dialects::cf::op_interfaces::YieldingRegion;
+use pliron_common_dialects::{
+    cf::{op_interfaces::YieldingRegion, ops::NDForOp},
+    index::ops::IndexConstantOp,
+};
 use pliron_llvm::ops::FuncOp;
 
 use crate::{
@@ -30,7 +34,7 @@ use crate::{
         op_interfaces::ElementWiseBinaryMemrefOpInterface,
         ops::{
             AllocOp, CopyOp as MemrefCopyOp, MatMulOp as MemrefMatMulOp,
-            ReshapeOp as MemrefReshapeOp, SubviewOp as MemrefSubviewOp, YieldOp,
+            ReshapeOp as MemrefReshapeOp, SliceParam, SubviewOp as MemrefSubviewOp, YieldOp,
         },
         type_interfaces::{Dimension, MultiDimensionalType, ShapedType},
         types::RankedMemrefType,
@@ -38,9 +42,9 @@ use crate::{
     tensor::{
         op_interfaces::ElementWiseBinaryTensorOpInterface,
         ops::{
-            AddOp, DivOp, ExtractOp, ExtractSliceOp as TensorExtractSliceOp, GenerateOp,
-            InsertSliceOp as TensorInsertSliceOp, MatMulOp, MulOp, ReshapeOp as TensorReshapeOp,
-            SubOp,
+            AddOp, BatchMatMulOp, DivOp, ExtractOp, ExtractSliceOp as TensorExtractSliceOp,
+            GenerateOp, InsertSliceOp as TensorInsertSliceOp, MatMulOp, MulOp,
+            ReshapeOp as TensorReshapeOp, SubOp,
         },
         types::RankedTensorType,
     },
@@ -344,6 +348,323 @@ impl ToMemrefDialect for MatMulOp {
         let matmul = MemrefMatMulOp::new(ctx, alloc.get_result(ctx), lhs, rhs);
         rewriter.append_operation(ctx, matmul.get_operation());
 
+        rewriter.replace_operation(ctx, self.get_operation(), alloc.get_operation());
+        Ok(())
+    }
+}
+
+// Lowering for tensor::BatchMatMulOp.
+// Creates a destination memref and then iterates over batch dimensions using NDForOp.
+// For each batch index, it creates subviews of lhs/rhs/result and performs 2D matmul.
+#[op_interface_impl]
+impl ToMemrefDialect for BatchMatMulOp {
+    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
+        use crate::memref::type_interfaces::Dimension;
+
+        let lhs = self.get_operation().deref(ctx).get_operand(0);
+        let rhs = self.get_operation().deref(ctx).get_operand(1);
+
+        let result_ty_ptr = self.get_result(ctx).get_type(ctx);
+        let converter = {
+            let result_ty_ref = result_ty_ptr.deref(ctx);
+            let result_ty = result_ty_ref
+                .downcast_ref::<RankedTensorType>()
+                .expect("BatchMatMulOp must have a ranked tensor result");
+            result_ty.converter()
+        };
+        let result_ty = converter(result_ty_ptr, ctx)?;
+        let result_ty = TypePtr::<RankedMemrefType>::from_ptr(result_ty, ctx)
+            .expect("Expected the converted type to be a RankedMemrefType");
+
+        let lhs_memref_ty = TypePtr::<RankedMemrefType>::from_ptr(lhs.get_type(ctx), ctx)
+            .expect("BatchMatMulOp lhs must be a ranked memref after conversion");
+        let rhs_memref_ty = TypePtr::<RankedMemrefType>::from_ptr(rhs.get_type(ctx), ctx)
+            .expect("BatchMatMulOp rhs must be a ranked memref after conversion");
+
+        let rank = lhs_memref_ty.deref(ctx).rank();
+        let batch_rank = rank - 2;
+
+        let lhs_shape = lhs_memref_ty.deref(ctx).shape().clone();
+        let rhs_shape = rhs_memref_ty.deref(ctx).shape().clone();
+        let result_shape = result_ty.deref(ctx).shape().clone();
+        let elem_ty = result_ty.deref(ctx).element_type();
+
+        let lhs_sizes = lhs_shape
+            .iter()
+            .enumerate()
+            .map(|(i, dim)| match dim {
+                Dimension::Dynamic => descriptor::unpack_size(ctx, rewriter, lhs, i),
+                Dimension::Static(v) => {
+                    let c = IndexConstantOp::new(ctx, *v);
+                    rewriter.append_op(ctx, c);
+                    c.get_result(ctx)
+                }
+            })
+            .collect::<Vec<_>>();
+        let rhs_sizes = rhs_shape
+            .iter()
+            .enumerate()
+            .map(|(i, dim)| match dim {
+                Dimension::Dynamic => descriptor::unpack_size(ctx, rewriter, rhs, i),
+                Dimension::Static(v) => {
+                    let c = IndexConstantOp::new(ctx, *v);
+                    rewriter.append_op(ctx, c);
+                    c.get_result(ctx)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let result_dynamic_dim_operands = result_shape
+            .iter()
+            .enumerate()
+            .filter_map(|(i, dim)| {
+                if let Dimension::Dynamic = dim {
+                    if i < batch_rank {
+                        Some(lhs_sizes[i])
+                    } else if i == batch_rank {
+                        Some(lhs_sizes[rank - 2])
+                    } else {
+                        Some(rhs_sizes[rank - 1])
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let alloc = AllocOp::new(ctx, result_ty, result_dynamic_dim_operands);
+        rewriter.append_op(ctx, alloc);
+
+        if batch_rank == 0 {
+            let matmul = MemrefMatMulOp::new(ctx, alloc.get_result(ctx), lhs, rhs);
+            rewriter.append_operation(ctx, matmul.get_operation());
+            rewriter.replace_operation(ctx, self.get_operation(), alloc.get_operation());
+            return Ok(());
+        }
+
+        let const_index_0 = IndexConstantOp::new(ctx, 0);
+        let const_index_1 = IndexConstantOp::new(ctx, 1);
+        rewriter.append_op(ctx, const_index_0);
+        rewriter.append_op(ctx, const_index_1);
+
+        let lb0 = const_index_0.get_result(ctx);
+        let step1 = const_index_1.get_result(ctx);
+
+        let batch_ubs = (0..batch_rank).map(|i| lhs_sizes[i]).collect::<Vec<_>>();
+
+        let ndfor = {
+            let scoped_rewriter = ScopedRewriter::new(rewriter, OpInsertionPoint::Unset);
+
+            struct State<'a> {
+                rewriter: ScopedRewriter<'a, Recorder, IRRewriter<Recorder>>,
+                lhs: Value,
+                rhs: Value,
+                dst: Value,
+                lhs_shape: Vec<Dimension>,
+                rhs_shape: Vec<Dimension>,
+                lhs_sizes: Vec<Value>,
+                rhs_sizes: Vec<Value>,
+                rank: usize,
+                batch_rank: usize,
+                elem_ty: Ptr<TypeObj>,
+            }
+
+            let mut state = State {
+                rewriter: scoped_rewriter,
+                lhs,
+                rhs,
+                dst: alloc.get_result(ctx),
+                lhs_shape,
+                rhs_shape,
+                lhs_sizes,
+                rhs_sizes,
+                rank,
+                batch_rank,
+                elem_ty,
+            };
+
+            NDForOp::new(
+                ctx,
+                vec![lb0; batch_rank],
+                batch_ubs,
+                vec![step1; batch_rank],
+                |ctx, state, inserter, indices| {
+                    let rewriter = &mut state.rewriter;
+                    rewriter.set_insertion_point(inserter.get_insertion_point());
+
+                    let dim_to_size = |dim: &Dimension, size_val: Value| match dim {
+                        Dimension::Static(v) => SliceParam::Static(*v),
+                        Dimension::Dynamic => SliceParam::Dynamic(size_val),
+                    };
+
+                    let one_sizes = vec![SliceParam::Static(1); state.batch_rank];
+                    let zero_offsets = vec![SliceParam::Static(0); 2];
+                    let unit_steps = vec![SliceParam::Static(1); state.rank];
+
+                    let lhs_m_dim = dim_to_size(
+                        &state.lhs_shape[state.rank - 2],
+                        state.lhs_sizes[state.rank - 2],
+                    );
+                    let lhs_k_dim = dim_to_size(
+                        &state.lhs_shape[state.rank - 1],
+                        state.lhs_sizes[state.rank - 1],
+                    );
+                    let rhs_k_dim = dim_to_size(
+                        &state.rhs_shape[state.rank - 2],
+                        state.rhs_sizes[state.rank - 2],
+                    );
+                    let rhs_n_dim = dim_to_size(
+                        &state.rhs_shape[state.rank - 1],
+                        state.rhs_sizes[state.rank - 1],
+                    );
+
+                    let mut lhs_offsets = indices
+                        .iter()
+                        .copied()
+                        .map(SliceParam::Dynamic)
+                        .collect::<Vec<_>>();
+                    lhs_offsets.extend(zero_offsets.clone());
+                    let mut lhs_sizes = one_sizes.clone();
+                    lhs_sizes.push(lhs_m_dim.clone());
+                    lhs_sizes.push(lhs_k_dim.clone());
+
+                    let lhs_subview = MemrefSubviewOp::new(
+                        ctx,
+                        state.lhs,
+                        lhs_offsets,
+                        lhs_sizes,
+                        unit_steps.clone(),
+                    );
+                    rewriter.append_op(ctx, lhs_subview);
+
+                    let mut rhs_offsets = indices
+                        .iter()
+                        .copied()
+                        .map(SliceParam::Dynamic)
+                        .collect::<Vec<_>>();
+                    rhs_offsets.extend(zero_offsets.clone());
+                    let mut rhs_sizes = one_sizes.clone();
+                    rhs_sizes.push(rhs_k_dim.clone());
+                    rhs_sizes.push(rhs_n_dim.clone());
+
+                    let rhs_subview = MemrefSubviewOp::new(
+                        ctx,
+                        state.rhs,
+                        rhs_offsets,
+                        rhs_sizes,
+                        unit_steps.clone(),
+                    );
+                    rewriter.append_op(ctx, rhs_subview);
+
+                    let mut dst_offsets = indices
+                        .iter()
+                        .copied()
+                        .map(SliceParam::Dynamic)
+                        .collect::<Vec<_>>();
+                    dst_offsets.extend(zero_offsets);
+                    let mut dst_sizes = one_sizes;
+                    dst_sizes.push(lhs_m_dim.clone());
+                    dst_sizes.push(rhs_n_dim.clone());
+
+                    let dst_subview =
+                        MemrefSubviewOp::new(ctx, state.dst, dst_offsets, dst_sizes, unit_steps);
+                    rewriter.append_op(ctx, dst_subview);
+
+                    let m_dim = match &lhs_m_dim {
+                        SliceParam::Static(v) => Dimension::Static(*v),
+                        SliceParam::Dynamic(_) => Dimension::Dynamic,
+                    };
+                    let k_dim = match &lhs_k_dim {
+                        SliceParam::Static(v) => Dimension::Static(*v),
+                        SliceParam::Dynamic(_) => Dimension::Dynamic,
+                    };
+                    let n_dim = match &rhs_n_dim {
+                        SliceParam::Static(v) => Dimension::Static(*v),
+                        SliceParam::Dynamic(_) => Dimension::Dynamic,
+                    };
+
+                    let lhs_2d_ty = RankedMemrefType::get(
+                        ctx,
+                        state.elem_ty,
+                        vec![m_dim.clone(), k_dim.clone()],
+                    );
+                    let rhs_2d_ty = RankedMemrefType::get(
+                        ctx,
+                        state.elem_ty,
+                        vec![k_dim.clone(), n_dim.clone()],
+                    );
+                    let dst_2d_ty = RankedMemrefType::get(
+                        ctx,
+                        state.elem_ty,
+                        vec![m_dim.clone(), n_dim.clone()],
+                    );
+
+                    let dyn_value = |p: &SliceParam| match p {
+                        SliceParam::Dynamic(v) => Some(*v),
+                        SliceParam::Static(_) => None,
+                    };
+
+                    let mut lhs_2d_dyn = Vec::new();
+                    if let Some(v) = dyn_value(&lhs_m_dim) {
+                        lhs_2d_dyn.push(v);
+                    }
+                    if let Some(v) = dyn_value(&lhs_k_dim) {
+                        lhs_2d_dyn.push(v);
+                    }
+
+                    let mut rhs_2d_dyn = Vec::new();
+                    if let Some(v) = dyn_value(&rhs_k_dim) {
+                        rhs_2d_dyn.push(v);
+                    }
+                    if let Some(v) = dyn_value(&rhs_n_dim) {
+                        rhs_2d_dyn.push(v);
+                    }
+
+                    let mut dst_2d_dyn = Vec::new();
+                    if let Some(v) = dyn_value(&lhs_m_dim) {
+                        dst_2d_dyn.push(v);
+                    }
+                    if let Some(v) = dyn_value(&rhs_n_dim) {
+                        dst_2d_dyn.push(v);
+                    }
+
+                    let lhs_2d = MemrefReshapeOp::new(
+                        ctx,
+                        lhs_subview.get_result(ctx),
+                        lhs_2d_dyn,
+                        lhs_2d_ty,
+                    );
+                    rewriter.append_op(ctx, lhs_2d);
+
+                    let rhs_2d = MemrefReshapeOp::new(
+                        ctx,
+                        rhs_subview.get_result(ctx),
+                        rhs_2d_dyn,
+                        rhs_2d_ty,
+                    );
+                    rewriter.append_op(ctx, rhs_2d);
+
+                    let dst_2d = MemrefReshapeOp::new(
+                        ctx,
+                        dst_subview.get_result(ctx),
+                        dst_2d_dyn,
+                        dst_2d_ty,
+                    );
+                    rewriter.append_op(ctx, dst_2d);
+
+                    let matmul = MemrefMatMulOp::new(
+                        ctx,
+                        dst_2d.get_result(ctx),
+                        lhs_2d.get_result(ctx),
+                        rhs_2d.get_result(ctx),
+                    );
+                    rewriter.append_operation(ctx, matmul.get_operation());
+                },
+                &mut state,
+            )
+        };
+
+        rewriter.append_op(ctx, ndfor);
         rewriter.replace_operation(ctx, self.get_operation(), alloc.get_operation());
         Ok(())
     }
