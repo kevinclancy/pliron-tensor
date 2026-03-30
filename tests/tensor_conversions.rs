@@ -717,18 +717,18 @@ fn test_extract_slice_tensor_to_memref() {
     expect![[r#"
         builtin.module @test_module 
         {
-          ^entry_block2v1():
+          ^entry_block2v1() !0:
             llvm.func @test_extract_slice_runtime: llvm.func <llvm.void (llvm.ptr , llvm.ptr ) variadic = false>
               [] 
             {
-              ^entry_block1v1(src_p_block1v1_arg0: llvm.ptr , out_p_block1v1_arg1: llvm.ptr ):
-                src_op4v1_res0 = llvm.load src_p_block1v1_arg0  : memref.ranked <10x20 : builtin.integer i64> !0;
-                op6v3_res0 = memref.alloc  : memref.ranked <5x10 : builtin.integer i64>;
+              ^entry_block1v1(src_p_block1v1_arg0: llvm.ptr , out_p_block1v1_arg1: llvm.ptr ) !1:
+                src_op4v1_res0 = llvm.load src_p_block1v1_arg0  : memref.ranked <10x20 : builtin.integer i64> !2;
+                op6v3_res0 = memref.alloc  : memref.ranked <5x10 : builtin.integer i64> !3;
                 memref.subview src_op4v1_res0 [0, 2] [5, 10] [1, 2] : memref.ranked <5x10 : builtin.integer i64>;
                 memref.copy op6v3_res0 <- op3v3_res0;
-                llvm.store *out_p_block1v1_arg1 <- op6v3_res0  !1;
-                llvm.return  !2
-            } !3
+                llvm.store *out_p_block1v1_arg1 <- op6v3_res0  !4;
+                llvm.return  !5
+            } !6
         }"#]].assert_eq(&exec_module_op.disp(exec_ctx).to_string());
     apply_dialect_conversion(exec_ctx, &mut MemrefToCF, exec_parsed_op).expect_ok(exec_ctx);
     apply_dialect_conversion(exec_ctx, &mut CFToLLVM, exec_parsed_op).expect_ok(exec_ctx);
@@ -943,20 +943,20 @@ fn test_insert_slice_tensor_to_memref() {
     expect![[r#"
         builtin.module @test_module 
         {
-          ^entry_block2v1():
+          ^entry_block2v1() !0:
             llvm.func @test_insert_slice_runtime: llvm.func <llvm.void (llvm.ptr , llvm.ptr , llvm.ptr ) variadic = false>
               [] 
             {
-              ^entry_block1v1(src_p_block1v1_arg0: llvm.ptr , dst_p_block1v1_arg1: llvm.ptr , out_p_block1v1_arg2: llvm.ptr ):
-                src_op4v1_res0 = llvm.load src_p_block1v1_arg0  : memref.ranked <5x10 : builtin.integer i64> !0;
-                dst_op6v1_res0 = llvm.load dst_p_block1v1_arg1  : memref.ranked <10x20 : builtin.integer i64> !1;
-                op8v3_res0 = memref.alloc  : memref.ranked <10x20 : builtin.integer i64>;
+              ^entry_block1v1(src_p_block1v1_arg0: llvm.ptr , dst_p_block1v1_arg1: llvm.ptr , out_p_block1v1_arg2: llvm.ptr ) !1:
+                src_op4v1_res0 = llvm.load src_p_block1v1_arg0  : memref.ranked <5x10 : builtin.integer i64> !2;
+                dst_op6v1_res0 = llvm.load dst_p_block1v1_arg1  : memref.ranked <10x20 : builtin.integer i64> !3;
+                op8v3_res0 = memref.alloc  : memref.ranked <10x20 : builtin.integer i64> !4;
                 memref.copy op8v3_res0 <- dst_op6v1_res0;
                 memref.subview op8v3_res0 [0, 2] [5, 10] [1, 2] : memref.ranked <5x10 : builtin.integer i64>;
                 memref.copy op3v3_res0 <- src_op4v1_res0;
-                llvm.store *out_p_block1v1_arg2 <- op8v3_res0  !2;
-                llvm.return  !3
-            } !4
+                llvm.store *out_p_block1v1_arg2 <- op8v3_res0  !5;
+                llvm.return  !6
+            } !7
         }"#]].assert_eq(&after_tensor_to_memref);
 
     apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
@@ -1089,20 +1089,20 @@ fn test_tensor_reshape_to_memref_cf_from_rust() {
     expect![[r#"
         builtin.module @test_module 
         {
-          ^entry_block2v1():
+          ^entry_block2v1() !0:
             llvm.func @test_tensor_reshape_extract: llvm.func <builtin.integer i64(llvm.ptr , builtin.integer i64, builtin.integer i64) variadic = false>
               [] 
             {
-              ^entry_block1v1(arg_p_block1v1_arg0: llvm.ptr , i_res_block1v1_arg1: builtin.integer i64, j_res_block1v1_arg2: builtin.integer i64):
-                arg_op4v1_res0 = llvm.load arg_p_block1v1_arg0  : memref.ranked <2x3 : builtin.integer i64> !0;
+              ^entry_block1v1(arg_p_block1v1_arg0: llvm.ptr , i_res_block1v1_arg1: builtin.integer i64, j_res_block1v1_arg2: builtin.integer i64) !1:
+                arg_op4v1_res0 = llvm.load arg_p_block1v1_arg0  : memref.ranked <2x3 : builtin.integer i64> !2;
                 op8v3_res0 = memref.alloc  : memref.ranked <2x3 : builtin.integer i64>;
                 memref.copy op8v3_res0 <- arg_op4v1_res0;
-                op3v3_res0 = memref.reshape op8v3_res0 : memref.ranked <3x2 : builtin.integer i64>;
-                i_idx_op7v1_res0 = index.from_integer i_res_block1v1_arg1 : index.index  !1;
-                j_idx_op9v1_res0 = index.from_integer j_res_block1v1_arg2 : index.index  !2;
-                memref.load op3v3_res0[i_idx_op7v1_res0, j_idx_op9v1_res0] : builtin.integer i64;
-                llvm.return op5v3_res0 !3
-            } !4
+                op3v3_res0 = memref.reshape op8v3_res0 : memref.ranked <3x2 : builtin.integer i64> !3;
+                i_idx_op7v1_res0 = index.from_integer i_res_block1v1_arg1 : index.index  !4;
+                j_idx_op9v1_res0 = index.from_integer j_res_block1v1_arg2 : index.index  !5;
+                memref.load op3v3_res0[i_idx_op7v1_res0, j_idx_op9v1_res0] : builtin.integer i64 !6;
+                llvm.return op5v3_res0 !7
+            } !8
         }"#]].assert_eq(&after_tensor_to_memref);
 
     apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);

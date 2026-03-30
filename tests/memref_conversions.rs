@@ -66,11 +66,11 @@ fn test_alloc_generate() {
     expect![[r#"
         builtin.module @test_module 
         {
-          ^entry_block3v1():
+          ^entry_block3v1() !0:
             llvm.func @test_alloc_generate: llvm.func <builtin.integer i64(builtin.integer i64, builtin.integer i64) variadic = false>
               [] 
             {
-              ^entry_block2v1(i_res_block2v1_arg0: builtin.integer i64, j_res_block2v1_arg1: builtin.integer i64):
+              ^entry_block2v1(i_res_block2v1_arg0: builtin.integer i64, j_res_block2v1_arg1: builtin.integer i64) !1:
                 op13v3_res0 = llvm.constant <builtin.integer <16: i64>> : builtin.integer i64;
                 op9v5_res0 = llvm.constant <builtin.integer <16: i64>> : builtin.integer i64;
                 op4v7_res0 = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
@@ -101,25 +101,25 @@ fn test_alloc_generate() {
                 op39v3_res0 = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
                 llvm.br ^for_op_header_block10v1(op24v3_res0)
 
-              ^for_op_header_block10v1(block10v1_arg0: builtin.integer i64):
+              ^for_op_header_block10v1(block10v1_arg0: builtin.integer i64) !2:
                 op11v7_res0 = llvm.icmp block10v1_arg0 <ULT> op37v1_res0 : builtin.integer i1;
                 llvm.cond_br if op11v7_res0 ^entry_block6v1(block10v1_arg0) else ^entry_split_block9v1()
 
-              ^entry_block6v1(iv_block6v1_arg0: builtin.integer i64):
+              ^entry_block6v1(iv_block6v1_arg0: builtin.integer i64) !3:
                 llvm.br ^for_op_header_block8v1(op24v3_res0)
 
               ^for_op_header_block8v1(block8v1_arg0: builtin.integer i64):
                 op41v3_res0 = llvm.icmp block8v1_arg0 <ULT> op38v1_res0 : builtin.integer i1;
                 llvm.cond_br if op41v3_res0 ^entry_block5v1(block8v1_arg0) else ^entry_split_block7v1()
 
-              ^entry_block5v1(iv_block5v1_arg0: builtin.integer i64):
+              ^entry_block5v1(iv_block5v1_arg0: builtin.integer i64) !4:
                 llvm.br ^entry_block4v1(iv_block6v1_arg0, iv_block5v1_arg0)
 
               ^entry_block4v1(block4v1_arg0: builtin.integer i64, block4v1_arg1: builtin.integer i64):
                 llvm.br ^entry_block1v1(block4v1_arg0, block4v1_arg1)
 
-              ^entry_block1v1(i_block1v1_arg0: builtin.integer i64, j_block1v1_arg1: builtin.integer i64):
-                sum_op10v1_res0 = llvm.add i_block1v1_arg0, j_res_block2v1_arg1 <{nsw=false,nuw=false}>: builtin.integer i64 !0;
+              ^entry_block1v1(i_block1v1_arg0: builtin.integer i64, j_block1v1_arg1: builtin.integer i64) !5:
+                sum_op10v1_res0 = llvm.add i_block1v1_arg0, j_res_block2v1_arg1 <{nsw=false,nuw=false}>: builtin.integer i64 !6;
                 op7v5_res0 = llvm.extract_value op36v1_res0[1] : llvm.ptr ;
                 op44v1_res0 = llvm.extract_value op36v1_res0[4] : llvm.array [2 x builtin.integer i64];
                 op45v1_res0 = llvm.extract_value op44v1_res0[0] : builtin.integer i64;
@@ -130,7 +130,7 @@ fn test_alloc_generate() {
                 op50v1_res0 = llvm.mul op46v1_res0, j_block1v1_arg1 <{nsw=false,nuw=false}>: builtin.integer i64;
                 op51v1_res0 = llvm.add op50v1_res0, op49v1_res0 <{nsw=false,nuw=false}>: builtin.integer i64;
                 op52v1_res0 = llvm.gep <builtin.integer i64> (op48v1_res0, op51v1_res0)[OperandIdx(1)] : llvm.ptr ;
-                llvm.store *op52v1_res0 <- sum_op10v1_res0 ;
+                llvm.store *op52v1_res0 <- sum_op10v1_res0  !7;
                 op69v1_res0 = llvm.add iv_block5v1_arg0, op39v3_res0 <{nsw=false,nuw=false}>: builtin.integer i64;
                 llvm.br ^for_op_header_block8v1(op69v1_res0)
 
@@ -149,9 +149,9 @@ fn test_alloc_generate() {
                 op60v1_res0 = llvm.mul op56v1_res0, j_res_block2v1_arg1 <{nsw=false,nuw=false}>: builtin.integer i64;
                 op61v1_res0 = llvm.add op60v1_res0, op59v1_res0 <{nsw=false,nuw=false}>: builtin.integer i64;
                 op62v1_res0 = llvm.gep <builtin.integer i64> (op58v1_res0, op61v1_res0)[OperandIdx(1)] : llvm.ptr ;
-                op63v1_res0 = llvm.load op62v1_res0  : builtin.integer i64;
-                llvm.return op63v1_res0 !1
-            } !2;
+                op63v1_res0 = llvm.load op62v1_res0  : builtin.integer i64 !8;
+                llvm.return op63v1_res0 !9
+            } !10;
             llvm.func @malloc: llvm.func <llvm.ptr (builtin.integer i64) variadic = false>
               []
         }"#]].assert_eq(&print_parsed);
