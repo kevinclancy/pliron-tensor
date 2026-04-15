@@ -872,7 +872,7 @@ impl ToMemrefDialect for TensorReshapeOp {
 pub struct TensorToMemref;
 
 impl DialectConversion for TensorToMemref {
-    fn can_convert_op(&mut self, ctx: &Context, op: Ptr<Operation>) -> bool {
+    fn can_convert_op(&self, ctx: &Context, op: Ptr<Operation>) -> bool {
         op_impls::<dyn ToMemrefDialect>(&*Operation::get_op_dyn(op, ctx))
             || Operation::get_op::<FuncOp>(op, ctx).is_some()
     }
@@ -893,7 +893,7 @@ impl DialectConversion for TensorToMemref {
         to_memref_op.rewrite(ctx, rewriter)
     }
 
-    fn can_convert_type(&mut self, _ctx: &Context, ty: Ptr<TypeObj>) -> bool {
+    fn can_convert_type(&self, _ctx: &Context, ty: Ptr<TypeObj>) -> bool {
         type_impls::<dyn ToMemrefType>(&**ty.deref(_ctx))
     }
 

@@ -1088,13 +1088,13 @@ impl ToCFDialect for ReshapeOp {
 pub struct MemrefToCF;
 
 impl DialectConversion for MemrefToCF {
-    fn can_convert_op(&mut self, ctx: &Context, op: Ptr<Operation>) -> bool {
+    fn can_convert_op(&self, ctx: &Context, op: Ptr<Operation>) -> bool {
         op_impls::<dyn ToCFDialect>(&*Operation::get_op_dyn(op, ctx))
             || Operation::get_op::<FuncOp>(op, ctx).is_some()
             || Operation::get_op::<pliron_llvm::ops::LoadOp>(op, ctx).is_some()
     }
 
-    fn can_convert_type(&mut self, ctx: &Context, ty: Ptr<TypeObj>) -> bool {
+    fn can_convert_type(&self, ctx: &Context, ty: Ptr<TypeObj>) -> bool {
         type_impls::<dyn ToLLVMType>(&**ty.deref(ctx))
     }
 
