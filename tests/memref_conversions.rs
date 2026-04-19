@@ -4,7 +4,7 @@ use pliron::{
     builtin::ops::ModuleOp,
     combine::Parser,
     context::Context,
-    init_env_logger, input_error_noloc,
+    init_env_logger_for_tests, input_error_noloc,
     irbuild::dialect_conversion::apply_dialect_conversion,
     irfmt::parsers::spaced,
     location,
@@ -271,7 +271,7 @@ fn test_alloc_generate() {
 /// Expected: `view[i][j] = src[i][1 + j] = i*3 + j + 1`.
 #[test]
 fn test_subview() {
-    init_env_logger!();
+    init_env_logger_for_tests!();
     let ctx = &mut Context::new();
 
     let input_ir = r#"
@@ -347,7 +347,7 @@ fn test_subview() {
 /// Test that `memref.copy` is correctly lowered to CF / LLVM.
 #[test]
 fn test_copy() {
-    init_env_logger!();
+    init_env_logger_for_tests!();
     let ctx = &mut Context::new();
 
     let input_ir = r#"
@@ -432,7 +432,7 @@ fn test_copy() {
 /// - copying `src` into `sub`
 #[test]
 fn test_insert_slice_sequence() {
-    init_env_logger!();
+    init_env_logger_for_tests!();
     let ctx = &mut Context::new();
 
     let input_ir = r#"
