@@ -10,12 +10,19 @@
 //! * The sizes (a rank length'd array) of each dimension of the memref.
 //! * The strides (a rank length'd array) of each dimension of the memref.
 
+use std::num::NonZero;
+
 use pliron::{
-    builtin::op_interfaces::OneResultInterface,
+    builtin::{
+        attributes::IntegerAttr,
+        op_interfaces::OneResultInterface,
+        types::{IntegerType, Signedness},
+    },
     context::{Context, Ptr},
     irbuild::{inserter::Inserter, listener::InsertionListener},
     result::Result,
     r#type::{TypeObj, TypePtr, Typed},
+    utils::apint::APInt,
     value::Value,
 };
 use pliron_common_dialects::index::ops::IndexConstantOp;
@@ -23,7 +30,10 @@ use pliron_llvm::{
     ToLLVMType,
     attributes::IntegerOverflowFlagsAttr,
     op_interfaces::IntBinArithOpWithOverflowFlag,
-    ops::{AddOp, ExtractValueOp, GepIndex, GetElementPtrOp, InsertValueOp, MulOp, UndefOp},
+    ops::{
+        AddOp, AllocaOp, ConstantOp, ExtractValueOp, GepIndex, GetElementPtrOp, InsertValueOp,
+        LoadOp, MulOp, StoreOp, UndefOp,
+    },
     types::StructType,
 };
 
@@ -279,6 +289,55 @@ pub fn unpack_size<L: InsertionListener, I: Inserter<L>>(
     .expect("Expected size field in sizes array");
     inserter.append_op(ctx, size);
     size.get_result(ctx)
+}
+
+/// Unpack / extract the size of a specific dimension from a memref descriptor,
+/// where the dimension index is provided as an SSA value.
+///
+/// This helper materializes the descriptor value into a stack slot and uses
+/// GEP + Load to access `descriptor.sizes[dim_idx]`.
+///
+/// We can't just re-use [unpack_size] because `ExtractValueOp` requires constant indices.
+pub fn unpack_size_dynamic_dim_idx<L: InsertionListener, I: Inserter<L>>(
+    ctx: &mut Context,
+    inserter: &mut I,
+    descriptor: Value,
+    dim_idx: Value,
+) -> Value {
+    let descriptor_ty = descriptor.get_type(ctx);
+    let size_elem_ty = IntegerType::get(ctx, 64, Signedness::Signless);
+    let one_attr = IntegerAttr::new(
+        size_elem_ty,
+        APInt::from_usize(
+            1,
+            NonZero::new(size_elem_ty.deref(ctx).width() as usize).unwrap(),
+        ),
+    );
+    let one = ConstantOp::new(ctx, Box::new(one_attr));
+    inserter.append_op(ctx, one);
+
+    let descriptor_slot = AllocaOp::new(ctx, descriptor_ty, one.get_result(ctx));
+    inserter.append_op(ctx, descriptor_slot);
+    let descriptor_slot_ptr = descriptor_slot.get_result(ctx);
+
+    let store_descriptor = StoreOp::new(ctx, descriptor, descriptor_slot_ptr);
+    inserter.append_op(ctx, store_descriptor);
+
+    let size_ptr = GetElementPtrOp::new(
+        ctx,
+        descriptor_slot_ptr,
+        vec![
+            GepIndex::Constant(0),
+            GepIndex::Constant(3),
+            GepIndex::Value(dim_idx),
+        ],
+        descriptor_ty,
+    );
+    inserter.append_op(ctx, size_ptr);
+
+    let load_size = LoadOp::new(ctx, size_ptr.get_result(ctx), size_elem_ty.into());
+    inserter.append_op(ctx, load_size);
+    load_size.get_result(ctx)
 }
 
 /// Unpack / extract the stride of a specific dimension from a memref descriptor.

@@ -49,7 +49,7 @@ use crate::memref::{
     descriptor,
     op_interfaces::ElementWiseBinaryMemrefOpInterface,
     ops::{
-        AddOp, AllocOp, CopyOp, DivOp, GenerateOp, LoadOp, MatMulOp as MemrefMatMulOp,
+        AddOp, AllocOp, CopyOp, DimOp, DivOp, GenerateOp, LoadOp, MatMulOp as MemrefMatMulOp,
         MulOp as MemrefMulOp, ReshapeOp, SliceParam, StoreOp, SubOp, SubviewOp, YieldOp,
     },
     type_interfaces::{MultiDimensionalType, ShapedType},
@@ -275,6 +275,35 @@ impl ToCFDialect for LoadOp {
         let load_op = pliron_llvm::ops::LoadOp::new(ctx, ptr, elem_ty);
         rewriter.append_op(ctx, load_op);
         rewriter.replace_operation(ctx, self.get_operation(), load_op.get_operation());
+        Ok(())
+    }
+}
+
+#[op_interface_impl]
+impl ToCFDialect for DimOp {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        let memref = self.get_source_memref(ctx);
+        let dim_idx = self.get_dimension_index(ctx);
+
+        let dim_size = match dim_idx {
+            // If the dimension index is a constant, it's more efficient to use `unpack_size`.
+            Value::OpResult { op, .. }
+                if let Some(index_const_op) = Operation::get_op::<IndexConstantOp>(op, ctx) =>
+            {
+                let dim = index_const_op
+                    .get_attr_constant_index(ctx)
+                    .unwrap()
+                    .constant_index;
+                descriptor::unpack_size(ctx, rewriter, memref, dim)
+            }
+            _ => descriptor::unpack_size_dynamic_dim_idx(ctx, rewriter, memref, dim_idx),
+        };
+        rewriter.replace_operation_with_values(ctx, self.get_operation(), vec![dim_size]);
         Ok(())
     }
 }

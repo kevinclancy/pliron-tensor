@@ -572,6 +572,56 @@ impl LoadOp {
     }
 }
 
+/// Op to query the runtime size of a memref dimension.
+///
+/// ## Operand(s)
+/// | operand | description | type |
+/// |-----|-------|----|
+/// | `memref` | The memref to query | [RankedMemrefType] |
+/// | `index` | The dimension index to query | [Index](IndexType). |
+///
+/// ## Result(s)
+/// | result | The size of the queried dimension, as [Index](IndexType). |
+#[pliron_op(
+    name = "memref.dim",
+    interfaces = [
+        OneResultInterface,
+        NResultsInterface<1>,
+        ResultNOfType<0, IndexType>,
+        NOpdsInterface<2>,
+        OperandNOfType<0, RankedMemrefType>,
+        OperandNOfType<1, IndexType>,
+    ],
+    format = "$0 `, ` $1 ` : ` type($0)",
+    verifier = "succ"
+)]
+pub struct DimOp;
+
+impl DimOp {
+    /// Create a new `DimOp`.
+    pub fn new(ctx: &mut Context, memref: Value, dim_index: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![IndexType::get(ctx).into()],
+            vec![memref, dim_index],
+            vec![],
+            0,
+        );
+        Self { op }
+    }
+
+    /// Get the memref operand.
+    pub fn get_source_memref(&self, ctx: &Context) -> Value {
+        self.get_operation().deref(ctx).get_operand(0)
+    }
+
+    /// Get the dimension index operand.
+    pub fn get_dimension_index(&self, ctx: &Context) -> Value {
+        self.get_operation().deref(ctx).get_operand(1)
+    }
+}
+
 /// Addition of two memrefs elementwise. The memrefs must have the same shape and element type.
 ///
 /// ## Operand(s)

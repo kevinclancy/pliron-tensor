@@ -263,6 +263,134 @@ fn test_alloc_generate() {
     }
 }
 
+#[test]
+fn test_memref_dim_dynamic_index() {
+    let ctx = &mut Context::new();
+
+    let input_ir = r#"
+        builtin.module @test_module {
+          ^entry():
+          llvm.func @test_memref_dim: llvm.func <builtin.integer i64 (builtin.integer i64) variadic = false> [] {
+            ^entry(dim_arg: builtin.integer i64):
+            memref = memref.alloc : memref.ranked<16 x 32 : builtin.integer i64>;
+            dim_idx = index.from_integer dim_arg : index.index;
+            dim = memref.dim memref, dim_idx : index.index;
+            dim_int = index.to_integer dim to builtin.integer i64;
+            llvm.return dim_int
+          }
+        }
+        "#;
+
+    let state_stream = state_stream_from_iterator(
+        input_ir.chars(),
+        parsable::State::new(ctx, location::Source::InMemory),
+    );
+    let parsed = spaced(Operation::top_level_parser())
+        .parse(state_stream)
+        .map(|(op, _)| op)
+        .map_err(|err| input_error_noloc!(err));
+
+    let parsed_op = parsed.expect_ok(ctx);
+    let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
+    apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    let print_parsed = format!("{}", module_op.disp(ctx));
+    assert!(!print_parsed.contains("memref.dim"));
+    assert!(print_parsed.contains("llvm.gep"));
+    assert!(print_parsed.contains("llvm.load"));
+
+    let llvm_ctx = LLVMContext::default();
+    let llvm_ir = pliron_llvm::to_llvm_ir::convert_module(ctx, &llvm_ctx, module_op).expect_ok(ctx);
+    llvm_ir
+        .verify()
+        .inspect_err(|e| println!("LLVM-IR verification failed: {}", e))
+        .unwrap();
+
+    initialize_native().expect("Failed to initialize native target for LLVM execution");
+    let jit = LLVMLLJIT::new_with_default_builder().expect("Failed to create LLJIT");
+    jit.add_module(llvm_ir)
+        .expect("Failed to add module to JIT");
+    let symbol_addr = jit
+        .lookup_symbol("test_memref_dim")
+        .expect("Failed to lookup symbol");
+    assert!(symbol_addr != 0);
+    let f = unsafe { std::mem::transmute::<u64, fn(i64) -> i64>(symbol_addr) };
+
+    assert_eq!(f(0), 16);
+    assert_eq!(f(1), 32);
+}
+
+#[test]
+fn test_memref_dim_const_index() {
+    let ctx = &mut Context::new();
+
+    let input_ir = r#"
+        builtin.module @test_module {
+          ^entry():
+          llvm.func @test_memref_dim_const_index: llvm.func <builtin.integer i64 () variadic = false> [] {
+            ^entry():
+            memref = memref.alloc : memref.ranked<16 x 32 : builtin.integer i64>;
+            idx0 = index.constant <index.constant 0> : index.index;
+            idx1 = index.constant <index.constant 1> : index.index;
+            dim0 = memref.dim memref, idx0 : index.index;
+            dim1 = memref.dim memref, idx1 : index.index;
+            dim0_i64 = index.to_integer dim0 to builtin.integer i64;
+            dim1_i64 = index.to_integer dim1 to builtin.integer i64;
+            thousand = llvm.constant <builtin.integer <1000: i64>> : builtin.integer i64;
+            scaled = llvm.mul dim0_i64, thousand <{nsw = false, nuw = false}> : builtin.integer i64;
+            encoded = llvm.add scaled, dim1_i64 <{nsw = false, nuw = false}> : builtin.integer i64;
+            llvm.return encoded
+          }
+        }
+        "#;
+
+    let state_stream = state_stream_from_iterator(
+        input_ir.chars(),
+        parsable::State::new(ctx, location::Source::InMemory),
+    );
+    let parsed = spaced(Operation::top_level_parser())
+        .parse(state_stream)
+        .map(|(op, _)| op)
+        .map_err(|err| input_error_noloc!(err));
+
+    let parsed_op = parsed.expect_ok(ctx);
+    let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
+    apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    let print_parsed = format!("{}", module_op.disp(ctx));
+    assert!(!print_parsed.contains("memref.dim"));
+    assert!(!print_parsed.contains("llvm.alloca"));
+    assert!(!print_parsed.contains("llvm.load"));
+
+    let llvm_ctx = LLVMContext::default();
+    let llvm_ir = pliron_llvm::to_llvm_ir::convert_module(ctx, &llvm_ctx, module_op).expect_ok(ctx);
+    llvm_ir
+        .verify()
+        .inspect_err(|e| println!("LLVM-IR verification failed: {}", e))
+        .unwrap();
+
+    initialize_native().expect("Failed to initialize native target for LLVM execution");
+    let jit = LLVMLLJIT::new_with_default_builder().expect("Failed to create LLJIT");
+    jit.add_module(llvm_ir)
+        .expect("Failed to add module to JIT");
+    let symbol_addr = jit
+        .lookup_symbol("test_memref_dim_const_index")
+        .expect("Failed to lookup symbol");
+    assert!(symbol_addr != 0);
+    let f = unsafe { std::mem::transmute::<u64, fn() -> i64>(symbol_addr) };
+
+    // Encoded return value = dim0 * 1000 + dim1 = 16 * 1000 + 32
+    assert_eq!(f(), 16032);
+}
+
 /// Test that `memref.subview` is correctly lowered to CF / LLVM.
 /// The function allocates a 2×3 source memref, fills it with `src[i][j] = i*3 + j`,
 /// then creates a 2×2 subview with offsets [0, 1] and steps [1, 1], and returns
