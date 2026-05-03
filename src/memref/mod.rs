@@ -10,26 +10,10 @@ pub mod types;
 
 use pliron::{
     context::{Context, Ptr},
-    derive::{op_interface, type_interface},
-    irbuild::dialect_conversion::DialectConversionRewriter,
-    op::Op,
+    derive::type_interface,
     result::Result,
     r#type::{Type, TypeObj},
 };
-
-/// Interface for rewriting to Memref dialect.
-#[op_interface]
-pub trait ToMemrefDialect {
-    /// Rewrite [self] to Memref dialect.
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()>;
-
-    fn verify(_op: &dyn Op, _ctx: &Context) -> Result<()>
-    where
-        Self: Sized,
-    {
-        Ok(())
-    }
-}
 
 /// A function pointer type for the [ToMemrefType] interface.
 pub type ToMemrefTypeFn = fn(self_ty: Ptr<TypeObj>, &mut Context) -> Result<Ptr<TypeObj>>;

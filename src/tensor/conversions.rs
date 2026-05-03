@@ -9,18 +9,18 @@ use pliron::{
     context::{Context, Ptr},
     derive::{op_interface_impl, type_interface_impl},
     irbuild::{
-        dialect_conversion::{DialectConversion, DialectConversionRewriter, OperandsInfo},
+        dialect_conversion::{DialectConversionRewriter, OperandsInfo},
         inserter::{BlockInsertionPoint, Inserter, OpInsertionPoint},
         listener::Recorder,
         rewriter::{IRRewriter, Rewriter, ScopedRewriter},
     },
     linked_list::ContainsLinkedList,
-    op::{Op, op_cast, op_impls},
+    op::Op,
     operation::Operation,
     region::Region,
     result::Result,
-    r#type::{TypeObj, TypePtr, Typed, type_cast, type_impls},
-    value::Value,
+    r#type::{TypeObj, TypePtr, Typed, type_cast},
+    value::{Use, Value},
 };
 use pliron_common_dialects::{
     cf::{op_interfaces::YieldingRegion, ops::NDForOp},
@@ -30,7 +30,7 @@ use pliron_llvm::ops::FuncOp;
 
 use crate::{
     memref::{
-        self, ToMemrefDialect, ToMemrefType, ToMemrefTypeFn, descriptor,
+        self, ToMemrefType, ToMemrefTypeFn, descriptor,
         op_interfaces::ElementWiseBinaryMemrefOpInterface,
         ops::{
             AllocOp, CopyOp as MemrefCopyOp, MatMulOp as MemrefMatMulOp,
@@ -40,6 +40,7 @@ use crate::{
         types::RankedMemrefType,
     },
     tensor::{
+        bufferize::{Alias, AliasKind, BufferRelation, BufferizableOpInterface},
         op_interfaces::ElementWiseBinaryTensorOpInterface,
         ops::{
             AddOp, BatchMatMulOp, DivOp, ExtractOp, ExtractSliceOp as TensorExtractSliceOp,
@@ -70,6 +71,22 @@ impl ToMemrefType for RankedTensorType {
     }
 }
 
+/// Convert a tensor type (which must implement [ToMemrefType]) to its
+/// memref equivalent. Returns an error if it cannot do the conversion.
+fn tensor_type_to_memref_type(
+    ty: Ptr<TypeObj>,
+    ctx: &mut Context,
+) -> Result<TypePtr<RankedMemrefType>> {
+    let maybe_conv: Option<ToMemrefTypeFn> =
+        type_cast::<dyn ToMemrefType>(&**ty.deref(ctx)).map(|t| t.converter());
+    let memref_ty_ptr = if let Some(conv) = maybe_conv {
+        conv(ty, ctx)?
+    } else {
+        ty
+    };
+    TypePtr::<RankedMemrefType>::from_ptr(memref_ty_ptr, ctx)
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum GenerateOpConversionErr {
     #[error("Unsupported induction variable type for GenerateOp conversion")]
@@ -77,19 +94,30 @@ pub enum GenerateOpConversionErr {
 }
 
 #[op_interface_impl]
-impl ToMemrefDialect for GenerateOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
-        let result_ty_ptr = self.get_result(ctx).get_type(ctx);
-        let converter = {
-            let result_ty_ref = result_ty_ptr.deref(ctx);
-            let result_ty = result_ty_ref
-                .downcast_ref::<RankedTensorType>()
-                .expect("GenerateOp must have a ranked tensor result");
-            result_ty.converter()
-        };
-        let result_ty = converter(result_ty_ptr, ctx)?;
-        let result_ty = TypePtr::<RankedMemrefType>::from_ptr(result_ty, ctx)
-            .expect("Expected the converted type to be a RankedMemrefType");
+impl BufferizableOpInterface for GenerateOp {
+    fn operand_bufferizes_to_memory_read(&self, _ctx: &Context, _opd: Use<Value>) -> bool {
+        false
+    }
+
+    fn operand_bufferizes_to_memory_write(&self, _ctx: &Context, _opd: Use<Value>) -> bool {
+        false
+    }
+
+    fn get_operand_result_aliases(&self, _ctx: &Context) -> Vec<Alias> {
+        vec![]
+    }
+
+    fn get_dynamic_dimensions(&self, ctx: &Context, _opd: Use<Value>) -> Option<Vec<Value>> {
+        Some(self.dynamic_dimensions(ctx))
+    }
+
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        let result_ty = tensor_type_to_memref_type(self.get_result(ctx).get_type(ctx), ctx)?;
 
         let region = self.get_region(ctx);
 
@@ -144,8 +172,29 @@ impl ToMemrefDialect for GenerateOp {
 }
 
 #[op_interface_impl]
-impl ToMemrefDialect for ExtractOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
+impl BufferizableOpInterface for ExtractOp {
+    fn operand_bufferizes_to_memory_read(&self, _ctx: &Context, opd: Use<Value>) -> bool {
+        opd.opd_idx == 0
+    }
+
+    fn operand_bufferizes_to_memory_write(&self, _ctx: &Context, _opd: Use<Value>) -> bool {
+        false
+    }
+
+    fn get_operand_result_aliases(&self, _ctx: &Context) -> Vec<Alias> {
+        vec![]
+    }
+
+    fn get_dynamic_dimensions(&self, _ctx: &Context, _opd: Use<Value>) -> Option<Vec<Value>> {
+        None
+    }
+
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operands_info: &OperandsInfo,
+    ) -> Result<()> {
         let operand = self.get_tensor_operand(ctx);
         let indices = self.get_index_operands(ctx);
         let result_ty = self.get_result(ctx).get_type(ctx);
@@ -163,17 +212,7 @@ trait ElementWiseBinaryTensorOpToMemref: ElementWiseBinaryTensorOpInterface {
         let lhs = self.get_operation().deref(ctx).get_operand(0);
         let rhs = self.get_operation().deref(ctx).get_operand(1);
 
-        let result_ty_ptr = self.get_result(ctx).get_type(ctx);
-        let converter = {
-            let result_ty_ref = result_ty_ptr.deref(ctx);
-            let result_ty = result_ty_ref
-                .downcast_ref::<RankedTensorType>()
-                .expect("AddOp must have a ranked tensor result");
-            result_ty.converter()
-        };
-        let result_ty = converter(result_ty_ptr, ctx)?;
-        let result_ty = TypePtr::<RankedMemrefType>::from_ptr(result_ty, ctx)
-            .expect("Expected the converted type to be a RankedMemrefType");
+        let result_ty = tensor_type_to_memref_type(self.get_result(ctx).get_type(ctx), ctx)?;
         let elem_ty = result_ty.deref(ctx).element_type();
         // Based on the operand shapes, it is possible that the result shape can be inferred
         // to have more static dimensions than what we know with `result_ty` above.
@@ -257,37 +296,73 @@ impl ElementWiseBinaryTensorOpToMemref for DivOp {
     }
 }
 
-#[op_interface_impl]
-impl ToMemrefDialect for AddOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
-        <Self as ElementWiseBinaryTensorOpToMemref>::rewrite(self, ctx, rewriter)
-    }
+macro_rules! impl_non_aliasing_bufferizable {
+    ($op_ty:ty) => {
+        #[op_interface_impl]
+        impl BufferizableOpInterface for $op_ty {
+            fn operand_bufferizes_to_memory_read(&self, _ctx: &Context, _opd: Use<Value>) -> bool {
+                true
+            }
+
+            fn operand_bufferizes_to_memory_write(&self, _ctx: &Context, _opd: Use<Value>) -> bool {
+                false
+            }
+
+            fn get_operand_result_aliases(&self, _ctx: &Context) -> Vec<Alias> {
+                vec![]
+            }
+
+            fn get_dynamic_dimensions(
+                &self,
+                _ctx: &Context,
+                _opd: Use<Value>,
+            ) -> Option<Vec<Value>> {
+                None
+            }
+
+            fn rewrite(
+                &self,
+                ctx: &mut Context,
+                rewriter: &mut DialectConversionRewriter,
+                _operands_info: &OperandsInfo,
+            ) -> Result<()> {
+                <Self as ElementWiseBinaryTensorOpToMemref>::rewrite(self, ctx, rewriter)
+            }
+        }
+    };
 }
 
-#[op_interface_impl]
-impl ToMemrefDialect for SubOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
-        <Self as ElementWiseBinaryTensorOpToMemref>::rewrite(self, ctx, rewriter)
-    }
-}
+impl_non_aliasing_bufferizable!(AddOp);
+impl_non_aliasing_bufferizable!(SubOp);
+impl_non_aliasing_bufferizable!(MulOp);
+impl_non_aliasing_bufferizable!(DivOp);
 
+/// Allow [pliron_llvm::ops::LoadOp] to participate in bufferization when it
+/// loads a tensor value — the rewrite converts the result type to memref.
 #[op_interface_impl]
-impl ToMemrefDialect for MulOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
-        <Self as ElementWiseBinaryTensorOpToMemref>::rewrite(self, ctx, rewriter)
+impl BufferizableOpInterface for pliron_llvm::ops::LoadOp {
+    fn operand_bufferizes_to_memory_read(&self, _ctx: &Context, _opd: Use<Value>) -> bool {
+        false
     }
-}
 
-#[op_interface_impl]
-impl ToMemrefDialect for DivOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
-        <Self as ElementWiseBinaryTensorOpToMemref>::rewrite(self, ctx, rewriter)
+    fn operand_bufferizes_to_memory_write(&self, _ctx: &Context, _opd: Use<Value>) -> bool {
+        false
     }
-}
 
-#[op_interface_impl]
-impl ToMemrefDialect for pliron_llvm::ops::LoadOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
+    fn get_operand_result_aliases(&self, _ctx: &Context) -> Vec<Alias> {
+        vec![]
+    }
+
+    fn get_dynamic_dimensions(&self, _ctx: &Context, _opd: Use<Value>) -> Option<Vec<Value>> {
+        None
+    }
+
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operands_info: &OperandsInfo,
+    ) -> Result<()> {
         let loaded_ty = self.get_result(ctx).get_type(ctx);
         let to_memref_ty =
             type_cast::<dyn ToMemrefType>(&**loaded_ty.deref(ctx)).map(|t| t.converter());
@@ -303,22 +378,33 @@ impl ToMemrefDialect for pliron_llvm::ops::LoadOp {
 
 // Lowering for tensor::MatMulOp -> AllocOp + memref::MatMulOp
 #[op_interface_impl]
-impl ToMemrefDialect for MatMulOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
+impl BufferizableOpInterface for MatMulOp {
+    fn operand_bufferizes_to_memory_read(&self, _ctx: &Context, _opd: Use<Value>) -> bool {
+        true
+    }
+
+    fn operand_bufferizes_to_memory_write(&self, _ctx: &Context, _opd: Use<Value>) -> bool {
+        false
+    }
+
+    fn get_operand_result_aliases(&self, _ctx: &Context) -> Vec<Alias> {
+        vec![]
+    }
+
+    fn get_dynamic_dimensions(&self, _ctx: &Context, _opd: Use<Value>) -> Option<Vec<Value>> {
+        None
+    }
+
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operands_info: &OperandsInfo,
+    ) -> Result<()> {
         let lhs = self.get_operation().deref(ctx).get_operand(0);
         let rhs = self.get_operation().deref(ctx).get_operand(1);
 
-        let result_ty_ptr = self.get_result(ctx).get_type(ctx);
-        let converter = {
-            let result_ty_ref = result_ty_ptr.deref(ctx);
-            let result_ty = result_ty_ref
-                .downcast_ref::<RankedTensorType>()
-                .expect("MatMulOp must have a ranked tensor result");
-            result_ty.converter()
-        };
-        let result_ty = converter(result_ty_ptr, ctx)?;
-        let result_ty = TypePtr::<RankedMemrefType>::from_ptr(result_ty, ctx)
-            .expect("Expected the converted type to be a RankedMemrefType");
+        let result_ty = tensor_type_to_memref_type(self.get_result(ctx).get_type(ctx), ctx)?;
         let elem_ty = result_ty.deref(ctx).element_type();
 
         // Build the dynamic dimension operands for the result allocation.
@@ -357,24 +443,35 @@ impl ToMemrefDialect for MatMulOp {
 // Creates a destination memref and then iterates over batch dimensions using NDForOp.
 // For each batch index, it creates subviews of lhs/rhs/result and performs 2D matmul.
 #[op_interface_impl]
-impl ToMemrefDialect for BatchMatMulOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
+impl BufferizableOpInterface for BatchMatMulOp {
+    fn operand_bufferizes_to_memory_read(&self, _ctx: &Context, _opd: Use<Value>) -> bool {
+        true
+    }
+
+    fn operand_bufferizes_to_memory_write(&self, _ctx: &Context, _opd: Use<Value>) -> bool {
+        false
+    }
+
+    fn get_operand_result_aliases(&self, _ctx: &Context) -> Vec<Alias> {
+        vec![]
+    }
+
+    fn get_dynamic_dimensions(&self, _ctx: &Context, _opd: Use<Value>) -> Option<Vec<Value>> {
+        None
+    }
+
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operands_info: &OperandsInfo,
+    ) -> Result<()> {
         use crate::memref::type_interfaces::Dimension;
 
         let lhs = self.get_operation().deref(ctx).get_operand(0);
         let rhs = self.get_operation().deref(ctx).get_operand(1);
 
-        let result_ty_ptr = self.get_result(ctx).get_type(ctx);
-        let converter = {
-            let result_ty_ref = result_ty_ptr.deref(ctx);
-            let result_ty = result_ty_ref
-                .downcast_ref::<RankedTensorType>()
-                .expect("BatchMatMulOp must have a ranked tensor result");
-            result_ty.converter()
-        };
-        let result_ty = converter(result_ty_ptr, ctx)?;
-        let result_ty = TypePtr::<RankedMemrefType>::from_ptr(result_ty, ctx)
-            .expect("Expected the converted type to be a RankedMemrefType");
+        let result_ty = tensor_type_to_memref_type(self.get_result(ctx).get_type(ctx), ctx)?;
 
         let lhs_memref_ty = TypePtr::<RankedMemrefType>::from_ptr(lhs.get_type(ctx), ctx)
             .expect("BatchMatMulOp lhs must be a ranked memref after conversion");
@@ -670,7 +767,9 @@ impl ToMemrefDialect for BatchMatMulOp {
     }
 }
 
-fn lower_func_op_to_llvm(func_op: &FuncOp, ctx: &mut Context) -> Result<()> {
+/// Update a [FuncOp]'s type signature and entry block argument types,
+/// converting any tensor types to their memref equivalents.
+pub fn lower_func_op_to_llvm(func_op: &FuncOp, ctx: &mut Context) -> Result<()> {
     // update the function type to convert any tensor types in the signature to memref types.
     let func_ty = func_op.get_type(ctx);
     let res_ty = func_ty.deref(ctx).result_type();
@@ -718,191 +817,146 @@ fn lower_func_op_to_llvm(func_op: &FuncOp, ctx: &mut Context) -> Result<()> {
     Ok(())
 }
 
-// Lowering for tensor::ExtractSliceOp -> memref.alloc + memref.subview + memref.copy
 #[op_interface_impl]
-impl ToMemrefDialect for TensorExtractSliceOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
-        let result_ty_ptr = self.get_result(ctx).get_type(ctx);
-        let converter = {
-            let result_ty_ref = result_ty_ptr.deref(ctx);
-            let result_ty = result_ty_ref
-                .downcast_ref::<RankedTensorType>()
-                .expect("ExtractSliceOp must have a ranked tensor result");
-            result_ty.converter()
-        };
-        let result_ty = converter(result_ty_ptr, ctx)?;
-        let result_ty = TypePtr::<RankedMemrefType>::from_ptr(result_ty, ctx)
-            .expect("Expected the converted type to be a RankedMemrefType");
+impl BufferizableOpInterface for TensorExtractSliceOp {
+    fn operand_bufferizes_to_memory_read(&self, _ctx: &Context, opd: Use<Value>) -> bool {
+        opd.opd_idx == 0
+    }
 
-        let source = self.source(ctx);
-        let offsets = self.slice_offsets(ctx);
-        let sizes = self.slice_sizes(ctx);
-        let steps = self.slice_steps(ctx);
+    fn operand_bufferizes_to_memory_write(&self, _ctx: &Context, _opd: Use<Value>) -> bool {
+        false
+    }
 
-        let dynamic_dim_operands = sizes
-            .iter()
-            .filter_map(|size| match size {
-                memref::ops::SliceParam::Dynamic(v) => Some(*v),
-                memref::ops::SliceParam::Static(_) => None,
-            })
-            .collect::<Vec<_>>();
+    fn get_operand_result_aliases(&self, ctx: &Context) -> Vec<Alias> {
+        let operand = self.get_operation().deref(ctx).get_operand_as_use(0);
+        vec![Alias {
+            operand,
+            result: self.get_result(ctx),
+            kind: AliasKind::Must,
+            relation: BufferRelation::Contains,
+        }]
+    }
 
-        let destination = AllocOp::new(ctx, result_ty, dynamic_dim_operands);
-        rewriter.append_op(ctx, destination);
+    fn get_dynamic_dimensions(&self, _ctx: &Context, _opd: Use<Value>) -> Option<Vec<Value>> {
+        None
+    }
 
-        let subview =
-            MemrefSubviewOp::new_with_result_type(ctx, source, offsets, sizes, steps, result_ty);
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        let subview = MemrefSubviewOp::new(
+            ctx,
+            self.source(ctx),
+            self.slice_offsets(ctx),
+            self.slice_sizes(ctx),
+            self.slice_steps(ctx),
+        );
         rewriter.append_op(ctx, subview);
-
-        let copy = MemrefCopyOp::new(ctx, destination.get_result(ctx), subview.get_result(ctx));
-        rewriter.append_op(ctx, copy);
-        rewriter.replace_operation(ctx, self.get_operation(), destination.get_operation());
+        rewriter.replace_operation(ctx, self.get_operation(), subview.get_operation());
         Ok(())
     }
 }
 
 #[op_interface_impl]
-impl ToMemrefDialect for TensorInsertSliceOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
-        let result_ty_ptr = self.get_result(ctx).get_type(ctx);
-        let converter = {
-            let result_ty_ref = result_ty_ptr.deref(ctx);
-            let result_ty = result_ty_ref
-                .downcast_ref::<RankedTensorType>()
-                .expect("InsertSliceOp must have a ranked tensor result");
-            result_ty.converter()
-        };
-        let result_ty = converter(result_ty_ptr, ctx)?;
-        let result_ty = TypePtr::<RankedMemrefType>::from_ptr(result_ty, ctx)
-            .expect("Expected the converted type to be a RankedMemrefType");
+impl BufferizableOpInterface for TensorInsertSliceOp {
+    fn operand_bufferizes_to_memory_read(&self, _ctx: &Context, _opd: Use<Value>) -> bool {
+        true
+    }
 
-        let source = self.source(ctx);
+    fn operand_bufferizes_to_memory_write(&self, _ctx: &Context, opd: Use<Value>) -> bool {
+        opd.opd_idx == 1
+    }
+
+    fn get_operand_result_aliases(&self, ctx: &Context) -> Vec<Alias> {
+        let operand = self
+            .get_operation()
+            .deref(ctx)
+            .operands_as_uses()
+            .find(|opd| opd.opd_idx == 1)
+            .expect("InsertSliceOp must have operand 1");
+        vec![Alias {
+            operand,
+            result: self.get_result(ctx),
+            kind: AliasKind::Must,
+            relation: BufferRelation::Equivalent,
+        }]
+    }
+
+    fn get_dynamic_dimensions(&self, _ctx: &Context, _opd: Use<Value>) -> Option<Vec<Value>> {
+        None
+    }
+
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operands_info: &OperandsInfo,
+    ) -> Result<()> {
         let destination = self.destination(ctx);
-
-        let result_shape = result_ty.deref(ctx).shape().clone();
-        let dynamic_dim_operands = result_shape
-            .iter()
-            .enumerate()
-            .filter_map(|(i, dim)| {
-                if let Dimension::Dynamic = dim {
-                    Some(descriptor::unpack_size(ctx, rewriter, destination, i))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let alloc = AllocOp::new(ctx, result_ty, dynamic_dim_operands);
-        rewriter.append_op(ctx, alloc);
-
-        // Preserve destination values in the new result memref, then overwrite the sliced window.
-        let copy_destination = MemrefCopyOp::new(ctx, alloc.get_result(ctx), destination);
-        rewriter.append_op(ctx, copy_destination);
-
         let view = MemrefSubviewOp::new(
             ctx,
-            alloc.get_result(ctx),
+            destination,
             self.slice_offsets(ctx),
             self.slice_sizes(ctx),
             self.slice_steps(ctx),
         );
         rewriter.append_op(ctx, view);
 
-        let copy_source = MemrefCopyOp::new(ctx, view.get_result(ctx), source);
+        let copy_source = MemrefCopyOp::new(ctx, view.get_result(ctx), self.source(ctx));
         rewriter.append_op(ctx, copy_source);
-        rewriter.replace_operation(ctx, self.get_operation(), alloc.get_operation());
+
+        rewriter.replace_operation_with_values(ctx, self.get_operation(), vec![destination]);
         Ok(())
     }
 }
 
-// Lowering for tensor::ReshapeOp -> memref.alloc + memref.copy + memref.reshape
 #[op_interface_impl]
-impl ToMemrefDialect for TensorReshapeOp {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
-        let source = self.get_source(ctx);
-        let source_memref_ty = TypePtr::<RankedMemrefType>::from_ptr(source.get_type(ctx), ctx)
-            .expect("ReshapeOp source must be a ranked memref after tensor-to-memref conversion");
-        let result_ty_ptr = self.get_result(ctx).get_type(ctx);
-        let converter = {
-            let result_ty_ref = result_ty_ptr.deref(ctx);
-            let result_ty = result_ty_ref
-                .downcast_ref::<RankedTensorType>()
-                .expect("ReshapeOp must have a ranked tensor result");
-            result_ty.converter()
-        };
-        let result_ty = converter(result_ty_ptr, ctx)?;
-        let result_ty = TypePtr::<RankedMemrefType>::from_ptr(result_ty, ctx)
-            .expect("Expected the converted type to be a RankedMemrefType");
-
-        // Create a contiguous copy of the source first, then reshape that copy by
-        // constructing a descriptor with the target shape.
-        let source_shape = source_memref_ty.deref(ctx).shape().clone();
-        let source_dyn_dims = source_shape
-            .iter()
-            .enumerate()
-            .filter_map(|(i, dim)| {
-                if let Dimension::Dynamic = dim {
-                    Some(descriptor::unpack_size(ctx, rewriter, source, i))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let source_copy_alloc = AllocOp::new(ctx, source_memref_ty, source_dyn_dims);
-        rewriter.append_op(ctx, source_copy_alloc);
-
-        let copy_source = MemrefCopyOp::new(ctx, source_copy_alloc.get_result(ctx), source);
-        rewriter.append_op(ctx, copy_source);
-
-        let memref_reshape = MemrefReshapeOp::new(
-            ctx,
-            source_copy_alloc.get_result(ctx),
-            self.get_dynamic_dimensions(ctx),
-            result_ty,
-        );
-        rewriter.append_op(ctx, memref_reshape);
-
-        rewriter.replace_operation(ctx, self.get_operation(), memref_reshape.get_operation());
-        Ok(())
+impl BufferizableOpInterface for TensorReshapeOp {
+    fn operand_bufferizes_to_memory_read(&self, _ctx: &Context, opd: Use<Value>) -> bool {
+        opd.opd_idx == 0
     }
-}
 
-/// Implement [DialectConversion] for tensor to memref conversion.
-pub struct TensorToMemref;
+    fn operand_bufferizes_to_memory_write(&self, _ctx: &Context, _opd: Use<Value>) -> bool {
+        false
+    }
 
-impl DialectConversion for TensorToMemref {
-    fn can_convert_op(&self, ctx: &Context, op: Ptr<Operation>) -> bool {
-        op_impls::<dyn ToMemrefDialect>(&*Operation::get_op_dyn(op, ctx))
-            || Operation::get_op::<FuncOp>(op, ctx).is_some()
+    fn get_operand_result_aliases(&self, ctx: &Context) -> Vec<Alias> {
+        let operand = self
+            .get_operation()
+            .deref(ctx)
+            .operands_as_uses()
+            .find(|opd| opd.opd_idx == 0)
+            .expect("ReshapeOp must have operand 0");
+        vec![Alias {
+            operand,
+            result: self.get_result(ctx),
+            kind: AliasKind::Must,
+            relation: BufferRelation::Equivalent,
+        }]
+    }
+
+    fn get_dynamic_dimensions(&self, _ctx: &Context, _opd: Use<Value>) -> Option<Vec<Value>> {
+        None
     }
 
     fn rewrite(
-        &mut self,
+        &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        op: Ptr<Operation>,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
-        if let Some(func_op) = Operation::get_op::<FuncOp>(op, ctx) {
-            return lower_func_op_to_llvm(&func_op, ctx);
-        }
-        let op_dyn = Operation::get_op_dyn(op, ctx);
-        let to_memref_op = op_cast::<dyn ToMemrefDialect>(&*op_dyn)
-            .expect("Matched Op must implement ToMemrefDialect");
-        to_memref_op.rewrite(ctx, rewriter)
-    }
-
-    fn can_convert_type(&self, _ctx: &Context, ty: Ptr<TypeObj>) -> bool {
-        type_impls::<dyn ToMemrefType>(&**ty.deref(_ctx))
-    }
-
-    fn convert_type(&mut self, _ctx: &mut Context, ty: Ptr<TypeObj>) -> Result<Ptr<TypeObj>> {
-        let to_memref_ty = type_cast::<dyn ToMemrefType>(&**ty.deref(_ctx)).map(|t| t.converter());
-        if let Some(to_memref_ty) = to_memref_ty {
-            to_memref_ty(ty, _ctx)
-        } else {
-            Ok(ty)
-        }
+        let result_ty = tensor_type_to_memref_type(self.get_result(ctx).get_type(ctx), ctx)?;
+        let memref_reshape = MemrefReshapeOp::new(
+            ctx,
+            self.get_source(ctx),
+            TensorReshapeOp::get_dynamic_dimensions(self, ctx),
+            result_ty,
+        );
+        rewriter.append_op(ctx, memref_reshape);
+        rewriter.replace_operation(ctx, self.get_operation(), memref_reshape.get_operation());
+        Ok(())
     }
 }

@@ -44,6 +44,11 @@ impl TensorDesciptor {
         self.aligned_ptr
     }
 
+    /// Get the offset (in elements) of the tensor.
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
     /// Get the sizes of the tensor.
     pub fn sizes(&self) -> &[usize] {
         &self.sizes
@@ -130,5 +135,69 @@ impl TensorDesciptor {
     /// Get the rank of the tensor.
     pub fn rank(&self) -> usize {
         self.sizes.len()
+    }
+
+    fn delinearize_index(&self, mut linear_idx: usize) -> Vec<usize> {
+        let rank = self.rank();
+        let mut idxs = vec![0; rank];
+        for d in (0..rank).rev() {
+            let dim = self.sizes[d];
+            idxs[d] = linear_idx % dim;
+            linear_idx /= dim;
+        }
+        idxs
+    }
+
+    fn strided_offset(&self, idxs: &[usize]) -> usize {
+        self.offset
+            + idxs
+                .iter()
+                .zip(self.strides.iter())
+                .map(|(idx, stride)| idx * stride)
+                .sum::<usize>()
+    }
+
+    /// Copy all tensor elements into `dst` in row-major logical order.
+    ///
+    /// This handles arbitrary strides in the descriptor. `dst` is cleared and
+    /// resized to `self.num_elements()`.
+    ///
+    /// # Safety
+    /// The descriptor pointers must reference valid memory for reading all
+    /// elements addressed by `sizes`, `strides`, and `offset`.
+    pub unsafe fn copy_to_vec<T: Copy>(&self, dst: &mut Vec<T>) {
+        assert_eq!(std::mem::size_of::<T>(), self.elem_size);
+        let total = self.num_elements();
+        dst.clear();
+        dst.reserve(total);
+
+        // Note: this allocates an index Vec per element; correct but not optimised.
+        // Rewrite iteratively if this is ever on a hot path.
+        let base_ptr = self.aligned_ptr as *const T;
+        for lin in 0..total {
+            let idxs = self.delinearize_index(lin);
+            let off = self.strided_offset(&idxs);
+            // SAFETY: Caller guarantees descriptor memory validity.
+            dst.push(unsafe { *base_ptr.add(off) });
+        }
+    }
+
+    /// Copy tensor elements from `src` (row-major logical order) into the
+    /// descriptor-backed memory, honoring descriptor strides.
+    ///
+    /// # Safety
+    /// The descriptor pointers must reference valid writable memory for all
+    /// elements addressed by `sizes`, `strides`, and `offset`.
+    pub unsafe fn copy_from_slice<T: Copy>(&self, src: &[T]) {
+        assert_eq!(std::mem::size_of::<T>(), self.elem_size);
+        assert_eq!(src.len(), self.num_elements());
+
+        let base_ptr = self.aligned_ptr as *mut T;
+        for (lin, value) in src.iter().copied().enumerate() {
+            let idxs = self.delinearize_index(lin);
+            let off = self.strided_offset(&idxs);
+            // SAFETY: Caller guarantees descriptor memory validity.
+            unsafe { *base_ptr.add(off) = value };
+        }
     }
 }

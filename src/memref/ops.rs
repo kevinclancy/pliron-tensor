@@ -67,6 +67,7 @@ use crate::memref::{
     format = "operands(CharSpace(`,`)) ` : ` type($0)",
     interfaces = [
         NResultsInterface<1>,
+        ResultNOfType<0, RankedMemrefType>,
         AtLeastNResultsInterface<1>,
         OneResultInterface,
         SameResultsType,
@@ -127,6 +128,52 @@ impl Verify for AllocOp {
         }
 
         Ok(())
+    }
+}
+
+/// Op to deallocate a memref.
+/// See MLIR's [DeallocOp](https://mlir.llvm.org/docs/Dialects/MemRef/#memrefdealloc-memrefdeallocop).
+///
+/// ### Operand(s)
+/// | operand | description |
+/// |-----|-------|
+/// | `memref` | The memref to deallocate. |
+#[pliron_op(
+    name = "memref.dealloc",
+    format = "$0",
+    interfaces = [
+        NResultsInterface<0>,
+        NOpdsInterface<1>,
+        AtLeastNOpdsInterface<1>,
+        OneOpdInterface,
+        OperandNOfType<0, RankedMemrefType>,
+    ],
+)]
+pub struct DeallocOp;
+
+impl Verify for DeallocOp {
+    fn verify(&self, _ctx: &Context) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl DeallocOp {
+    /// Create a new `DeallocOp` for the given memref.
+    pub fn new(ctx: &mut Context, memref: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            vec![memref],
+            vec![],
+            0,
+        );
+        Self { op }
+    }
+
+    /// Get the memref operand to deallocate.
+    pub fn get_memref(&self, ctx: &Context) -> Value {
+        self.get_operation().deref(ctx).get_operand(0)
     }
 }
 
@@ -1031,7 +1078,13 @@ impl Printable for SubviewOp {
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
         let source = self.source(ctx);
-        write!(f, "{} {}", Self::get_opid_static(), source.disp(ctx))?;
+        write!(
+            f,
+            "${} = {} {}",
+            self.get_result(ctx).disp(ctx),
+            Self::get_opid_static(),
+            source.disp(ctx)
+        )?;
 
         let offsets = self.slice_offsets(ctx);
         let sizes = self.slice_sizes(ctx);

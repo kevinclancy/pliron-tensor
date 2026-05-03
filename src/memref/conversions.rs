@@ -35,9 +35,11 @@ use pliron_common_dialects::{
     },
 };
 use pliron_llvm::{
-    ToLLVMType, ToLLVMTypeFn,
+    ToLLVMDialect, ToLLVMType, ToLLVMTypeFn,
     attributes::{FastmathFlagsAttr, IntegerOverflowFlagsAttr},
-    function_call_utils::{compute_type_size_in_bytes, lookup_or_create_malloc_fn},
+    function_call_utils::{
+        compute_type_size_in_bytes, lookup_or_create_free_fn, lookup_or_create_malloc_fn,
+    },
     op_interfaces::{
         BinArithOp, CastOpInterface, FloatBinArithOpWithFastMathFlags,
         IntBinArithOpWithOverflowFlag,
@@ -45,15 +47,19 @@ use pliron_llvm::{
     ops::{BrOp, CallOp, FuncOp, MulOp},
 };
 
-use crate::memref::{
-    descriptor,
-    op_interfaces::ElementWiseBinaryMemrefOpInterface,
-    ops::{
-        AddOp, AllocOp, CopyOp, DimOp, DivOp, GenerateOp, LoadOp, MatMulOp as MemrefMatMulOp,
-        MulOp as MemrefMulOp, ReshapeOp, SliceParam, StoreOp, SubOp, SubviewOp, YieldOp,
+use crate::{
+    memref::{
+        descriptor,
+        op_interfaces::ElementWiseBinaryMemrefOpInterface,
+        ops::{
+            AddOp, AllocOp, CopyOp, DeallocOp, DimOp, DivOp, GenerateOp, LoadOp,
+            MatMulOp as MemrefMatMulOp, MulOp as MemrefMulOp, ReshapeOp, SliceParam, StoreOp,
+            SubOp, SubviewOp, YieldOp,
+        },
+        type_interfaces::{MultiDimensionalType, ShapedType},
+        types::RankedMemrefType,
     },
-    type_interfaces::{MultiDimensionalType, ShapedType},
-    types::RankedMemrefType,
+    tensor::bufferize::{MemrefAllocOpInterface, MemrefDeallocOpInterface},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -134,6 +140,88 @@ impl ToCFDialect for AllocOp {
         // Replace uses of the original AllocOp's result with the newly built descriptor.
         rewriter.replace_operation_with_values(ctx, self.get_operation(), vec![descriptor]);
         Ok(())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DeallocOpRewriteError {
+    #[error("Nearest symbol table not found")]
+    NearestSymbolTableNotFound,
+}
+
+// Replace [DeallocOp] with
+// * Extract the allocated pointer from the memref descriptor.
+// * A `free` call on the allocated pointer.
+#[op_interface_impl]
+impl ToCFDialect for DeallocOp {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        let memref = self.get_memref(ctx);
+        let allocated_ptr = descriptor::unpack_allocated_ptr(ctx, rewriter, memref);
+
+        let symbol_table_op = nearest_symbol_table(ctx, self.get_operation()).ok_or_else(|| {
+            input_error!(
+                self.loc(ctx),
+                DeallocOpRewriteError::NearestSymbolTableNotFound
+            )
+        })?;
+        let free_fn =
+            lookup_or_create_free_fn(ctx, &mut SymbolTableCollection::default(), symbol_table_op)?;
+        let call_free_op = CallOp::new(
+            ctx,
+            CallOpCallable::Direct(free_fn.get_symbol_name(ctx)),
+            free_fn.get_type(ctx),
+            vec![allocated_ptr],
+        );
+        rewriter.append_op(ctx, call_free_op);
+        rewriter.replace_operation(ctx, self.get_operation(), call_free_op.get_operation());
+        Ok(())
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMDialect for AllocOp {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        <Self as ToCFDialect>::rewrite(self, ctx, rewriter, operands_info)
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMDialect for DeallocOp {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        <Self as ToCFDialect>::rewrite(self, ctx, rewriter, operands_info)
+    }
+}
+
+#[op_interface_impl]
+impl MemrefAllocOpInterface for AllocOp {
+    fn try_new(
+        ctx: &mut Context,
+        memref_ty: TypePtr<RankedMemrefType>,
+        dynamic_sizes: Vec<Value>,
+    ) -> Result<Self> {
+        Ok(Self::new(ctx, memref_ty, dynamic_sizes))
+    }
+}
+
+#[op_interface_impl]
+impl MemrefDeallocOpInterface for DeallocOp {
+    fn try_new(ctx: &mut Context, memref: Value) -> Result<Self> {
+        Ok(Self::new(ctx, memref))
     }
 }
 

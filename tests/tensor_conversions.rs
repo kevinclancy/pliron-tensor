@@ -20,8 +20,11 @@ use pliron_common_dialects::cf::to_llvm::CFToLLVM;
 use pliron_llvm::llvm_sys::{core::LLVMContext, lljit::LLVMLLJIT, target::initialize_native};
 
 use pliron_tensor::{
-    memref::conversions::MemrefToCF,
-    tensor::{conversions::TensorToMemref, runtime_utils::TensorDesciptor},
+    memref::{
+        conversions::MemrefToCF,
+        ops::{AllocOp, DeallocOp},
+    },
+    tensor::{bufferize::bufferize, runtime_utils::TensorDesciptor},
 };
 
 #[test]
@@ -71,7 +74,7 @@ fn test_tensor_to_memref_conversion() {
     log::debug!("pliron module parsed {}", module_op.disp(ctx));
     verify_op(&module_op, ctx).expect_ok(ctx);
 
-    apply_dialect_conversion(ctx, &mut TensorToMemref, parsed_op).expect_ok(ctx);
+    bufferize::<AllocOp, DeallocOp>(parsed_op, ctx).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
     log::debug!(
@@ -140,7 +143,7 @@ fn test_int_tensor_from_rust() {
     log::debug!("pliron module parsed {}", module_op.disp(ctx));
     verify_op(&module_op, ctx).expect_ok(ctx);
 
-    apply_dialect_conversion(ctx, &mut TensorToMemref, parsed_op).expect_ok(ctx);
+    bufferize::<AllocOp, DeallocOp>(parsed_op, ctx).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
     log::debug!(
@@ -284,7 +287,7 @@ fn test_int_tensor_matmul_from_rust(input_ir: &str) {
     log::debug!("pliron module parsed {}", module_op.disp(ctx));
     verify_op(&module_op, ctx).expect_ok(ctx);
 
-    apply_dialect_conversion(ctx, &mut TensorToMemref, parsed_op).expect_ok(ctx);
+    bufferize::<AllocOp, DeallocOp>(parsed_op, ctx).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
     log::debug!(
@@ -390,7 +393,7 @@ fn test_batch_matmul_from_rust() {
     let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
     verify_op(&module_op, ctx).expect_ok(ctx);
 
-    apply_dialect_conversion(ctx, &mut TensorToMemref, parsed_op).expect_ok(ctx);
+    bufferize::<AllocOp, DeallocOp>(parsed_op, ctx).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
     verify_op(&module_op, ctx).expect_ok(ctx);
@@ -486,7 +489,7 @@ fn test_float_tensor_from_rust() {
     log::debug!("pliron module parsed {}", module_op.disp(ctx));
     verify_op(&module_op, ctx).expect_ok(ctx);
 
-    apply_dialect_conversion(ctx, &mut TensorToMemref, parsed_op).expect_ok(ctx);
+    bufferize::<AllocOp, DeallocOp>(parsed_op, ctx).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
     log::debug!(
@@ -600,7 +603,7 @@ fn test_float_tensor_all_binary_ops_from_rust() {
     log::debug!("pliron module parsed {}", module_op.disp(ctx));
     verify_op(&module_op, ctx).expect_ok(ctx);
 
-    apply_dialect_conversion(ctx, &mut TensorToMemref, parsed_op).expect_ok(ctx);
+    bufferize::<AllocOp, DeallocOp>(parsed_op, ctx).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
     log::debug!(
@@ -713,7 +716,7 @@ fn test_extract_slice_tensor_to_memref() {
     let exec_module_op = Operation::get_op::<ModuleOp>(exec_parsed_op, exec_ctx).unwrap();
 
     verify_op(&exec_module_op, exec_ctx).expect_ok(exec_ctx);
-    apply_dialect_conversion(exec_ctx, &mut TensorToMemref, exec_parsed_op).expect_ok(exec_ctx);
+    bufferize::<AllocOp, DeallocOp>(exec_parsed_op, exec_ctx).expect_ok(exec_ctx);
     expect![[r#"
         builtin.module @test_module 
         {
@@ -723,9 +726,7 @@ fn test_extract_slice_tensor_to_memref() {
             {
               ^entry_block1v1(src_p_block1v1_arg0: llvm.ptr , out_p_block1v1_arg1: llvm.ptr ) !1:
                 src_op4v1_res0 = llvm.load src_p_block1v1_arg0  : memref.ranked <10x20 : builtin.integer i64> !2;
-                op6v3_res0 = memref.alloc  : memref.ranked <5x10 : builtin.integer i64> !3;
-                memref.subview src_op4v1_res0 [0, 2] [5, 10] [1, 2] : memref.ranked <5x10 : builtin.integer i64>;
-                memref.copy op6v3_res0 <- op3v3_res0;
+                $op6v3_res0 = memref.subview src_op4v1_res0 [0, 2] [5, 10] [1, 2] : memref.ranked <5x10 : builtin.integer i64> !3;
                 llvm.store *out_p_block1v1_arg1 <- op6v3_res0  !4;
                 llvm.return  !5
             } !6
@@ -775,12 +776,8 @@ fn test_extract_slice_tensor_to_memref() {
     let out_tensor_descr = unsafe {
         TensorDesciptor::from_ir_descriptor(out_ir_descr.as_ptr(), 2, std::mem::size_of::<u64>())
     };
-    let out_slice = unsafe {
-        std::slice::from_raw_parts(
-            out_tensor_descr.aligned_ptr() as *const u64,
-            out_tensor_descr.num_elements(),
-        )
-    };
+    let mut actual: Vec<u64> = Vec::new();
+    unsafe { out_tensor_descr.copy_to_vec(&mut actual) };
 
     let mut expected = Vec::with_capacity(5 * 10);
     for i in 0..5_u64 {
@@ -789,7 +786,7 @@ fn test_extract_slice_tensor_to_memref() {
             expected.push(i * 20 + 2 + 2 * j);
         }
     }
-    assert_eq!(out_slice, expected.as_slice());
+    assert_eq!(actual, expected);
 }
 
 /// Test that two sequential `tensor.extract_slice` operations are lowered and
@@ -827,7 +824,7 @@ fn test_extract_slice_tensor_to_memref_sequential() {
     let exec_module_op = Operation::get_op::<ModuleOp>(exec_parsed_op, exec_ctx).unwrap();
 
     verify_op(&exec_module_op, exec_ctx).expect_ok(exec_ctx);
-    apply_dialect_conversion(exec_ctx, &mut TensorToMemref, exec_parsed_op).expect_ok(exec_ctx);
+    bufferize::<AllocOp, DeallocOp>(exec_parsed_op, exec_ctx).expect_ok(exec_ctx);
     let after_tensor_to_memref = format!("{}", exec_module_op.disp(exec_ctx));
     assert!(
         !after_tensor_to_memref.contains("tensor.extract_slice"),
@@ -836,10 +833,6 @@ fn test_extract_slice_tensor_to_memref_sequential() {
     assert!(
         after_tensor_to_memref.matches("memref.subview").count() >= 2,
         "expected at least two memref.subview ops after lowering"
-    );
-    assert!(
-        after_tensor_to_memref.matches("memref.copy").count() >= 2,
-        "expected at least two memref.copy ops after lowering"
     );
 
     apply_dialect_conversion(exec_ctx, &mut MemrefToCF, exec_parsed_op).expect_ok(exec_ctx);
@@ -887,12 +880,8 @@ fn test_extract_slice_tensor_to_memref_sequential() {
     let out_tensor_descr = unsafe {
         TensorDesciptor::from_ir_descriptor(out_ir_descr.as_ptr(), 2, std::mem::size_of::<u64>())
     };
-    let out_slice = unsafe {
-        std::slice::from_raw_parts(
-            out_tensor_descr.aligned_ptr() as *const u64,
-            out_tensor_descr.num_elements(),
-        )
-    };
+    let mut actual: Vec<u64> = Vec::new();
+    unsafe { out_tensor_descr.copy_to_vec(&mut actual) };
 
     let mut expected = Vec::with_capacity(3 * 4);
     for i in 0..3_u64 {
@@ -902,7 +891,7 @@ fn test_extract_slice_tensor_to_memref_sequential() {
             expected.push((2 + 2 * i) * 20 + (4 + 4 * j));
         }
     }
-    assert_eq!(out_slice, expected.as_slice());
+    assert_eq!(actual, expected);
 }
 
 /// Test that `tensor.insert_slice` is lowered and executed correctly end-to-end:
@@ -938,7 +927,7 @@ fn test_insert_slice_tensor_to_memref() {
     let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
     verify_op(&module_op, ctx).expect_ok(ctx);
 
-    apply_dialect_conversion(ctx, &mut TensorToMemref, parsed_op).expect_ok(ctx);
+    bufferize::<AllocOp, DeallocOp>(parsed_op, ctx).expect_ok(ctx);
     let after_tensor_to_memref = format!("{}", module_op.disp(ctx));
     expect![[r#"
         builtin.module @test_module 
@@ -950,13 +939,11 @@ fn test_insert_slice_tensor_to_memref() {
               ^entry_block1v1(src_p_block1v1_arg0: llvm.ptr , dst_p_block1v1_arg1: llvm.ptr , out_p_block1v1_arg2: llvm.ptr ) !1:
                 src_op4v1_res0 = llvm.load src_p_block1v1_arg0  : memref.ranked <5x10 : builtin.integer i64> !2;
                 dst_op6v1_res0 = llvm.load dst_p_block1v1_arg1  : memref.ranked <10x20 : builtin.integer i64> !3;
-                op8v3_res0 = memref.alloc  : memref.ranked <10x20 : builtin.integer i64> !4;
-                memref.copy op8v3_res0 <- dst_op6v1_res0;
-                memref.subview op8v3_res0 [0, 2] [5, 10] [1, 2] : memref.ranked <5x10 : builtin.integer i64>;
-                memref.copy op3v3_res0 <- src_op4v1_res0;
-                llvm.store *out_p_block1v1_arg2 <- op8v3_res0  !5;
-                llvm.return  !6
-            } !7
+                $op8v3_res0 = memref.subview dst_op6v1_res0 [0, 2] [5, 10] [1, 2] : memref.ranked <5x10 : builtin.integer i64>;
+                memref.copy op8v3_res0 <- src_op4v1_res0;
+                llvm.store *out_p_block1v1_arg2 <- dst_op6v1_res0  !4;
+                llvm.return  !5
+            } !6
         }"#]].assert_eq(&after_tensor_to_memref);
 
     apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
@@ -1084,7 +1071,7 @@ fn test_tensor_reshape_to_memref_cf_from_rust() {
     log::debug!("pliron module parsed {}", module_op.disp(ctx));
     verify_op(&module_op, ctx).expect_ok(ctx);
 
-    apply_dialect_conversion(ctx, &mut TensorToMemref, parsed_op).expect_ok(ctx);
+    bufferize::<AllocOp, DeallocOp>(parsed_op, ctx).expect_ok(ctx);
     let after_tensor_to_memref = format!("{}", module_op.disp(ctx));
     expect![[r#"
         builtin.module @test_module 
@@ -1095,12 +1082,10 @@ fn test_tensor_reshape_to_memref_cf_from_rust() {
             {
               ^entry_block1v1(arg_p_block1v1_arg0: llvm.ptr , i_res_block1v1_arg1: builtin.integer i64, j_res_block1v1_arg2: builtin.integer i64) !1:
                 arg_op4v1_res0 = llvm.load arg_p_block1v1_arg0  : memref.ranked <2x3 : builtin.integer i64> !2;
-                op8v3_res0 = memref.alloc  : memref.ranked <2x3 : builtin.integer i64>;
-                memref.copy op8v3_res0 <- arg_op4v1_res0;
-                op3v3_res0 = memref.reshape op8v3_res0 : memref.ranked <3x2 : builtin.integer i64> !3;
+                op8v3_res0 = memref.reshape arg_op4v1_res0 : memref.ranked <3x2 : builtin.integer i64> !3;
                 i_idx_op7v1_res0 = index.from_integer i_res_block1v1_arg1 : index.index  !4;
                 j_idx_op9v1_res0 = index.from_integer j_res_block1v1_arg2 : index.index  !5;
-                memref.load op3v3_res0[i_idx_op7v1_res0, j_idx_op9v1_res0] : builtin.integer i64 !6;
+                memref.load op8v3_res0[i_idx_op7v1_res0, j_idx_op9v1_res0] : builtin.integer i64 !6;
                 llvm.return op5v3_res0 !7
             } !8
         }"#]].assert_eq(&after_tensor_to_memref);
