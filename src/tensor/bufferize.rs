@@ -55,8 +55,6 @@ pub enum BufferRelation {
     Unknown,
     /// Operand buffer may contain the result buffer.
     Contains,
-    /// Operand buffer may be contained in the result buffer.
-    Contained,
     /// Operand buffer and result buffer are equivalent.
     Equivalent,
 }
@@ -384,6 +382,11 @@ impl<'tmm, TMM: TensorMemoryManager> DialectConversion for Bufferizer<'tmm, TMM>
 ///    Replace the operand with the new buffer.
 ///    (b): If the operand is not live after the op: No action.
 /// 3. Rewrite the IR using dialect conversion, which invokes [BufferizableOpInterface::rewrite].
+///
+/// The invariant maintained is that, a buffer (memref) is at most mapped to
+/// one tensor value at any point in the program. This also means that an operation
+/// implementing [BufferizableOpInterface] must not break this invariant in its rewrite method.
+/// For example, multiple results of the same op must not bufferize to the same memref.
 pub fn bufferize<TMM: TensorMemoryManager>(
     tmm: &mut TMM,
     op: Ptr<Operation>,
@@ -419,6 +422,17 @@ pub fn bufferize<TMM: TensorMemoryManager>(
             if aliasing_results.is_empty()
                 || Alias::operand_aliases_with_multiple_results(&aliases, opd)
                 || Alias::operand_aliases_with_other_operands(&aliases, opd)
+            {
+                continue;
+            }
+
+            // If the operand is used multiple times in the same op,
+            // bufferizing in-place may break the invariant that a buffer
+            // is mapped to at most one tensor value.
+            if op
+                .deref(ctx)
+                .operands_as_uses()
+                .any(|opd_| opd != opd_ && opd_.get_def(ctx) == opd.get_def(ctx))
             {
                 continue;
             }
