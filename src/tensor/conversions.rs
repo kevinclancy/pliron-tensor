@@ -33,14 +33,16 @@ use crate::{
         self, ToMemrefType, ToMemrefTypeFn, descriptor,
         op_interfaces::ElementWiseBinaryMemrefOpInterface,
         ops::{
-            AllocOp, CopyOp as MemrefCopyOp, MatMulOp as MemrefMatMulOp,
-            ReshapeOp as MemrefReshapeOp, SliceParam, SubviewOp as MemrefSubviewOp, YieldOp,
+            CopyOp as MemrefCopyOp, MatMulOp as MemrefMatMulOp, ReshapeOp as MemrefReshapeOp,
+            SliceParam, SubviewOp as MemrefSubviewOp, YieldOp,
         },
         type_interfaces::{Dimension, MultiDimensionalType, ShapedType},
         types::RankedMemrefType,
     },
     tensor::{
-        bufferize::{Alias, AliasKind, BufferRelation, BufferizableOpInterface},
+        bufferize::{
+            Alias, AliasKind, BufferRelation, BufferizableOpInterface, BufferizerCallbacks,
+        },
         op_interfaces::ElementWiseBinaryTensorOpInterface,
         ops::{
             AddOp, BatchMatMulOp, DivOp, ExtractOp, ExtractSliceOp as TensorExtractSliceOp,
@@ -115,14 +117,19 @@ impl BufferizableOpInterface for GenerateOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
+        bufferizer_callbacks: &dyn BufferizerCallbacks,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let result_ty = tensor_type_to_memref_type(self.get_result(ctx).get_type(ctx), ctx)?;
 
         let region = self.get_region(ctx);
 
-        let alloc = AllocOp::new(ctx, result_ty, self.dynamic_dimensions(ctx).clone());
-        rewriter.append_op(ctx, alloc);
+        let alloc = bufferizer_callbacks.create_memref_alloc(
+            ctx,
+            result_ty,
+            self.dynamic_dimensions(ctx),
+        )?;
+        rewriter.append_operation(ctx, alloc.get_operation());
 
         let yield_op = self.get_yield(ctx);
 
@@ -193,6 +200,7 @@ impl BufferizableOpInterface for ExtractOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
+        _bufferizer_callbacks: &dyn BufferizerCallbacks,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let operand = self.get_tensor_operand(ctx);
@@ -208,7 +216,13 @@ impl BufferizableOpInterface for ExtractOp {
 }
 
 trait ElementWiseBinaryTensorOpToMemref: ElementWiseBinaryTensorOpInterface {
-    fn rewrite(&self, ctx: &mut Context, rewriter: &mut DialectConversionRewriter) -> Result<()> {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        bufferizer_callbacks: &dyn BufferizerCallbacks,
+        _operands_info: &OperandsInfo,
+    ) -> Result<()> {
         let lhs = self.get_operation().deref(ctx).get_operand(0);
         let rhs = self.get_operation().deref(ctx).get_operand(1);
 
@@ -231,8 +245,9 @@ trait ElementWiseBinaryTensorOpToMemref: ElementWiseBinaryTensorOpInterface {
             .collect::<Vec<_>>();
         let result_ty = RankedMemrefType::get(ctx, elem_ty, compatible_shape);
 
-        let alloc = AllocOp::new(ctx, result_ty, dynamic_dim_operands);
-        rewriter.append_op(ctx, alloc);
+        let alloc =
+            bufferizer_callbacks.create_memref_alloc(ctx, result_ty, dynamic_dim_operands)?;
+        rewriter.append_operation(ctx, alloc.get_operation());
         let add = self.build_memref_op(ctx, alloc.get_result(ctx), lhs, rhs);
         rewriter.append_operation(ctx, add);
         rewriter.replace_operation(ctx, self.get_operation(), alloc.get_operation());
@@ -324,9 +339,16 @@ macro_rules! impl_non_aliasing_bufferizable {
                 &self,
                 ctx: &mut Context,
                 rewriter: &mut DialectConversionRewriter,
+                bufferizer_callbacks: &dyn BufferizerCallbacks,
                 _operands_info: &OperandsInfo,
             ) -> Result<()> {
-                <Self as ElementWiseBinaryTensorOpToMemref>::rewrite(self, ctx, rewriter)
+                <Self as ElementWiseBinaryTensorOpToMemref>::rewrite(
+                    self,
+                    ctx,
+                    rewriter,
+                    bufferizer_callbacks,
+                    _operands_info,
+                )
             }
         }
     };
@@ -361,6 +383,7 @@ impl BufferizableOpInterface for pliron_llvm::ops::LoadOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
+        _bufferizer_callbacks: &dyn BufferizerCallbacks,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let loaded_ty = self.get_result(ctx).get_type(ctx);
@@ -399,6 +422,7 @@ impl BufferizableOpInterface for MatMulOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
+        bufferizer_callbacks: &dyn BufferizerCallbacks,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let lhs = self.get_operation().deref(ctx).get_operand(0);
@@ -428,8 +452,12 @@ impl BufferizableOpInterface for MatMulOp {
             .collect::<Vec<_>>();
 
         let result_memref_ty = RankedMemrefType::get(ctx, elem_ty, result_shape);
-        let alloc = AllocOp::new(ctx, result_memref_ty, dynamic_dim_operands);
-        rewriter.append_op(ctx, alloc);
+        let alloc = bufferizer_callbacks.create_memref_alloc(
+            ctx,
+            result_memref_ty,
+            dynamic_dim_operands,
+        )?;
+        rewriter.append_operation(ctx, alloc.get_operation());
 
         let matmul = MemrefMatMulOp::new(ctx, alloc.get_result(ctx), lhs, rhs);
         rewriter.append_operation(ctx, matmul.get_operation());
@@ -464,6 +492,7 @@ impl BufferizableOpInterface for BatchMatMulOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
+        bufferizer_callbacks: &dyn BufferizerCallbacks,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         use crate::memref::type_interfaces::Dimension;
@@ -529,8 +558,12 @@ impl BufferizableOpInterface for BatchMatMulOp {
             })
             .collect::<Vec<_>>();
 
-        let alloc = AllocOp::new(ctx, result_ty, result_dynamic_dim_operands);
-        rewriter.append_op(ctx, alloc);
+        let alloc = bufferizer_callbacks.create_memref_alloc(
+            ctx,
+            result_ty,
+            result_dynamic_dim_operands,
+        )?;
+        rewriter.append_operation(ctx, alloc.get_operation());
 
         if batch_rank == 0 {
             let matmul = MemrefMatMulOp::new(ctx, alloc.get_result(ctx), lhs, rhs);
@@ -845,6 +878,7 @@ impl BufferizableOpInterface for TensorExtractSliceOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
+        _bufferizer_callbacks: &dyn BufferizerCallbacks,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let subview = MemrefSubviewOp::new(
@@ -893,6 +927,7 @@ impl BufferizableOpInterface for TensorInsertSliceOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
+        _bufferizer_callbacks: &dyn BufferizerCallbacks,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let destination = self.destination(ctx);
@@ -946,6 +981,7 @@ impl BufferizableOpInterface for TensorReshapeOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
+        _bufferizer_callbacks: &dyn BufferizerCallbacks,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let result_ty = tensor_type_to_memref_type(self.get_result(ctx).get_type(ctx), ctx)?;

@@ -169,6 +169,7 @@ pub trait BufferizableOpInterface {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
+        bufferizer_callbacks: &dyn BufferizerCallbacks,
         operands_info: &OperandsInfo,
     ) -> Result<()>;
 
@@ -207,6 +208,7 @@ pub trait BufferizableOpInterface {
 }
 
 /// An [Op] to Allocate a buffer (memref) for the given tensor type and dynamic sizes (if any).
+/// For a simple malloc-like allocation, use [AllocOp](crate::memref::ops::AllocOp).
 #[op_interface]
 pub trait MemrefAllocOpInterface:
     OneResultInterface + ResultNOfType<0, RankedMemrefType> + ToLLVMDialect
@@ -228,7 +230,8 @@ pub trait MemrefAllocOpInterface:
     }
 }
 
-/// An [Op] to Deallocate a buffer (memref).
+/// An [Op] to Deallocate a buffer (memref). For a simple free-like deallocation,
+/// use [DeallocOp](crate::memref::ops::DeallocOp).
 #[op_interface]
 pub trait MemrefDeallocOpInterface: AtLeastNOpdsInterface<1> + ToLLVMDialect {
     /// Create a new [Self] to deallocate the buffer in `memref`.
@@ -242,6 +245,22 @@ pub trait MemrefDeallocOpInterface: AtLeastNOpdsInterface<1> + ToLLVMDialect {
     {
         Ok(())
     }
+}
+
+/// Callbacks provided to [BufferizableOpInterface::rewrite] to create alloc and dealloc ops
+pub trait BufferizerCallbacks {
+    fn create_memref_alloc(
+        &self,
+        ctx: &mut Context,
+        memref_ty: TypePtr<RankedMemrefType>,
+        dynamic_sizes: Vec<Value>,
+    ) -> Result<Box<dyn MemrefAllocOpInterface>>;
+
+    fn create_memref_dealloc(
+        &self,
+        ctx: &mut Context,
+        memref: Value,
+    ) -> Result<Box<dyn MemrefDeallocOpInterface>>;
 }
 
 /// A helper struct that implements [DialectConversion]
@@ -324,8 +343,41 @@ impl<A: MemrefAllocOpInterface, D: MemrefDeallocOpInterface> DialectConversion
             Operation::replace_operand(op, ctx, opd.opd_idx, new_buffer);
         }
 
+        struct BufferizerCallbacksAD<A: MemrefAllocOpInterface, D: MemrefDeallocOpInterface> {
+            alloc_op: std::marker::PhantomData<A>,
+            dealloc_op: std::marker::PhantomData<D>,
+        }
+        impl<A: MemrefAllocOpInterface, D: MemrefDeallocOpInterface> BufferizerCallbacks
+            for BufferizerCallbacksAD<A, D>
+        {
+            fn create_memref_alloc(
+                &self,
+                ctx: &mut Context,
+                memref_ty: TypePtr<RankedMemrefType>,
+                dynamic_sizes: Vec<Value>,
+            ) -> Result<Box<dyn MemrefAllocOpInterface>> {
+                Ok(Box::new(A::try_new(ctx, memref_ty, dynamic_sizes)?))
+            }
+
+            fn create_memref_dealloc(
+                &self,
+                ctx: &mut Context,
+                memref: Value,
+            ) -> Result<Box<dyn MemrefDeallocOpInterface>> {
+                Ok(Box::new(D::try_new(ctx, memref)?))
+            }
+        }
+
         // Rewrite the op to use memref semantics.
-        op_iface.rewrite(ctx, rewriter, _operands_info)
+        op_iface.rewrite(
+            ctx,
+            rewriter,
+            &BufferizerCallbacksAD::<A, D> {
+                alloc_op: std::marker::PhantomData,
+                dealloc_op: std::marker::PhantomData,
+            },
+            _operands_info,
+        )
     }
 
     fn can_convert_type(&self, ctx: &Context, ty: Ptr<TypeObj>) -> bool {
