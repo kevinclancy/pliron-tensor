@@ -35,7 +35,7 @@ use pliron_common_dialects::{
     },
 };
 use pliron_llvm::{
-    ToLLVMDialect, ToLLVMType, ToLLVMTypeFn,
+    ToLLVMType, ToLLVMTypeFn,
     attributes::{FastmathFlagsAttr, IntegerOverflowFlagsAttr},
     function_call_utils::{
         compute_type_size_in_bytes, lookup_or_create_free_fn, lookup_or_create_malloc_fn,
@@ -47,19 +47,16 @@ use pliron_llvm::{
     ops::{BrOp, CallOp, FuncOp, MulOp},
 };
 
-use crate::{
-    memref::{
-        descriptor,
-        op_interfaces::ElementWiseBinaryMemrefOpInterface,
-        ops::{
-            AddOp, AllocOp, CopyOp, DeallocOp, DimOp, DivOp, GenerateOp, LoadOp,
-            MatMulOp as MemrefMatMulOp, MulOp as MemrefMulOp, ReshapeOp, SliceParam, StoreOp,
-            SubOp, SubviewOp, YieldOp,
-        },
-        type_interfaces::{MultiDimensionalType, ShapedType},
-        types::RankedMemrefType,
+use crate::memref::{
+    descriptor,
+    op_interfaces::ElementWiseBinaryMemrefOpInterface,
+    ops::{
+        AddOp, AllocOp, CopyOp, DeallocOp, DimOp, DivOp, GenerateOp, LoadOp,
+        MatMulOp as MemrefMatMulOp, MulOp as MemrefMulOp, ReshapeOp, SliceParam, StoreOp, SubOp,
+        SubviewOp, YieldOp,
     },
-    tensor::bufferize::{MemrefAllocOpInterface, MemrefDeallocOpInterface},
+    type_interfaces::{MultiDimensionalType, ShapedType},
+    types::RankedMemrefType,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -180,48 +177,6 @@ impl ToCFDialect for DeallocOp {
         rewriter.append_op(ctx, call_free_op);
         rewriter.replace_operation(ctx, self.get_operation(), call_free_op.get_operation());
         Ok(())
-    }
-}
-
-#[op_interface_impl]
-impl ToLLVMDialect for AllocOp {
-    fn rewrite(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        <Self as ToCFDialect>::rewrite(self, ctx, rewriter, operands_info)
-    }
-}
-
-#[op_interface_impl]
-impl ToLLVMDialect for DeallocOp {
-    fn rewrite(
-        &self,
-        ctx: &mut Context,
-        rewriter: &mut DialectConversionRewriter,
-        operands_info: &OperandsInfo,
-    ) -> Result<()> {
-        <Self as ToCFDialect>::rewrite(self, ctx, rewriter, operands_info)
-    }
-}
-
-#[op_interface_impl]
-impl MemrefAllocOpInterface for AllocOp {
-    fn try_new(
-        ctx: &mut Context,
-        memref_ty: TypePtr<RankedMemrefType>,
-        dynamic_sizes: Vec<Value>,
-    ) -> Result<Self> {
-        Ok(Self::new(ctx, memref_ty, dynamic_sizes))
-    }
-}
-
-#[op_interface_impl]
-impl MemrefDeallocOpInterface for DeallocOp {
-    fn try_new(ctx: &mut Context, memref: Value) -> Result<Self> {
-        Ok(Self::new(ctx, memref))
     }
 }
 

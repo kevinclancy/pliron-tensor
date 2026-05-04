@@ -32,3 +32,9 @@ pub struct SliceParamsAttr {
     /// For each dimension: the step (static or dynamic)
     pub steps: Vec<SliceParamAttr>,
 }
+
+#[pliron_attr(name = "memref.const_pointer", format = "$0", verifier = "succ")]
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash)]
+pub struct ConstPointerAttr(pub *const ());
+unsafe impl Send for ConstPointerAttr {}
+unsafe impl Sync for ConstPointerAttr {}

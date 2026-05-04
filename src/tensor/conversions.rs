@@ -41,7 +41,7 @@ use crate::{
     },
     tensor::{
         bufferize::{
-            Alias, AliasKind, BufferRelation, BufferizableOpInterface, BufferizerCallbacks,
+            Alias, AliasKind, BufferRelation, BufferizableOpInterface, TensorMemoryManager,
         },
         op_interfaces::ElementWiseBinaryTensorOpInterface,
         ops::{
@@ -117,7 +117,7 @@ impl BufferizableOpInterface for GenerateOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        bufferizer_callbacks: &dyn BufferizerCallbacks,
+        bufferizer_callbacks: &mut dyn TensorMemoryManager,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let result_ty = tensor_type_to_memref_type(self.get_result(ctx).get_type(ctx), ctx)?;
@@ -200,7 +200,7 @@ impl BufferizableOpInterface for ExtractOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _bufferizer_callbacks: &dyn BufferizerCallbacks,
+        _bufferizer_callbacks: &mut dyn TensorMemoryManager,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let operand = self.get_tensor_operand(ctx);
@@ -220,7 +220,7 @@ trait ElementWiseBinaryTensorOpToMemref: ElementWiseBinaryTensorOpInterface {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        bufferizer_callbacks: &dyn BufferizerCallbacks,
+        bufferizer_callbacks: &mut dyn TensorMemoryManager,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let lhs = self.get_operation().deref(ctx).get_operand(0);
@@ -339,7 +339,7 @@ macro_rules! impl_non_aliasing_bufferizable {
                 &self,
                 ctx: &mut Context,
                 rewriter: &mut DialectConversionRewriter,
-                bufferizer_callbacks: &dyn BufferizerCallbacks,
+                bufferizer_callbacks: &mut dyn TensorMemoryManager,
                 _operands_info: &OperandsInfo,
             ) -> Result<()> {
                 <Self as ElementWiseBinaryTensorOpToMemref>::rewrite(
@@ -383,7 +383,7 @@ impl BufferizableOpInterface for pliron_llvm::ops::LoadOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _bufferizer_callbacks: &dyn BufferizerCallbacks,
+        _bufferizer_callbacks: &mut dyn TensorMemoryManager,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let loaded_ty = self.get_result(ctx).get_type(ctx);
@@ -422,7 +422,7 @@ impl BufferizableOpInterface for MatMulOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        bufferizer_callbacks: &dyn BufferizerCallbacks,
+        bufferizer_callbacks: &mut dyn TensorMemoryManager,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let lhs = self.get_operation().deref(ctx).get_operand(0);
@@ -492,7 +492,7 @@ impl BufferizableOpInterface for BatchMatMulOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        bufferizer_callbacks: &dyn BufferizerCallbacks,
+        bufferizer_callbacks: &mut dyn TensorMemoryManager,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         use crate::memref::type_interfaces::Dimension;
@@ -878,7 +878,7 @@ impl BufferizableOpInterface for TensorExtractSliceOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _bufferizer_callbacks: &dyn BufferizerCallbacks,
+        _bufferizer_callbacks: &mut dyn TensorMemoryManager,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let subview = MemrefSubviewOp::new(
@@ -927,7 +927,7 @@ impl BufferizableOpInterface for TensorInsertSliceOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _bufferizer_callbacks: &dyn BufferizerCallbacks,
+        _bufferizer_callbacks: &mut dyn TensorMemoryManager,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let destination = self.destination(ctx);
@@ -981,7 +981,7 @@ impl BufferizableOpInterface for TensorReshapeOp {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        _bufferizer_callbacks: &dyn BufferizerCallbacks,
+        _bufferizer_callbacks: &mut dyn TensorMemoryManager,
         _operands_info: &OperandsInfo,
     ) -> Result<()> {
         let result_ty = tensor_type_to_memref_type(self.get_result(ctx).get_type(ctx), ctx)?;

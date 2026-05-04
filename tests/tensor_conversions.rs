@@ -20,11 +20,12 @@ use pliron_common_dialects::cf::to_llvm::CFToLLVM;
 use pliron_llvm::llvm_sys::{core::LLVMContext, lljit::LLVMLLJIT, target::initialize_native};
 
 use pliron_tensor::{
-    memref::{
-        conversions::MemrefToCF,
-        ops::{AllocOp, DeallocOp},
+    memref::conversions::MemrefToCF,
+    tensor::{
+        bufferize::{MallocFreeTMM, TensorMemoryManager, bufferize},
+        runtime_utils::TensorDesciptor,
+        tracked_tmm::TrackedTMM,
     },
-    tensor::{bufferize::bufferize, runtime_utils::TensorDesciptor},
 };
 
 #[test]
@@ -74,7 +75,8 @@ fn test_tensor_to_memref_conversion() {
     log::debug!("pliron module parsed {}", module_op.disp(ctx));
     verify_op(&module_op, ctx).expect_ok(ctx);
 
-    bufferize::<AllocOp, DeallocOp>(parsed_op, ctx).expect_ok(ctx);
+    let mut tmm = MallocFreeTMM;
+    bufferize(&mut tmm, parsed_op, ctx).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
     log::debug!(
@@ -143,8 +145,14 @@ fn test_int_tensor_from_rust() {
     log::debug!("pliron module parsed {}", module_op.disp(ctx));
     verify_op(&module_op, ctx).expect_ok(ctx);
 
-    bufferize::<AllocOp, DeallocOp>(parsed_op, ctx).expect_ok(ctx);
+    let mut tmm = TrackedTMM::new();
+    bufferize(&mut tmm, parsed_op, ctx).expect_ok(ctx);
+    log::debug!("pliron module after bufferization {}", module_op.disp(ctx));
     apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
+    log::debug!(
+        "pliron module after Memref to CF conversion {}",
+        module_op.disp(ctx)
+    );
     apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
     log::debug!(
         "pliron module after dialect conversion to LLVM {}",
@@ -163,6 +171,9 @@ fn test_int_tensor_from_rust() {
     // Let's try and execute this function
     initialize_native().expect("Failed to initialize native target for LLVM execution");
     let jit = LLVMLLJIT::new_with_default_builder().expect("Failed to create LLJIT");
+    tmm.register_runtime_symbols(&jit)
+        .expect("Failed to register runtime symbols for TrackedTMM");
+
     jit.add_module(llvm_ir)
         .expect("Failed to add module to JIT");
     let symbol_addr = jit
@@ -195,11 +206,17 @@ fn test_int_tensor_from_rust() {
 
     let mut res_ir_descr = res_descr.build_ir_descriptor();
 
+    // No tensor is allocated by the IR yet
+    assert_eq!(tmm.tracked_allocations().len(), 0);
+
     f(
         t1.build_ir_descriptor().as_ptr(),
         t2.build_ir_descriptor().as_ptr(),
         res_ir_descr.as_mut_ptr(),
     );
+
+    // We have one tensor allocated for the result.
+    assert_eq!(tmm.tracked_allocations().len(), 1);
 
     let res_tensor_descr = unsafe {
         TensorDesciptor::from_ir_descriptor(res_ir_descr.as_ptr(), 2, std::mem::size_of::<u64>())
@@ -287,7 +304,8 @@ fn test_int_tensor_matmul_from_rust(input_ir: &str) {
     log::debug!("pliron module parsed {}", module_op.disp(ctx));
     verify_op(&module_op, ctx).expect_ok(ctx);
 
-    bufferize::<AllocOp, DeallocOp>(parsed_op, ctx).expect_ok(ctx);
+    let mut tmm = MallocFreeTMM;
+    bufferize(&mut tmm, parsed_op, ctx).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
     log::debug!(
@@ -393,7 +411,8 @@ fn test_batch_matmul_from_rust() {
     let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
     verify_op(&module_op, ctx).expect_ok(ctx);
 
-    bufferize::<AllocOp, DeallocOp>(parsed_op, ctx).expect_ok(ctx);
+    let mut tmm = MallocFreeTMM;
+    bufferize(&mut tmm, parsed_op, ctx).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
     verify_op(&module_op, ctx).expect_ok(ctx);
@@ -489,7 +508,8 @@ fn test_float_tensor_from_rust() {
     log::debug!("pliron module parsed {}", module_op.disp(ctx));
     verify_op(&module_op, ctx).expect_ok(ctx);
 
-    bufferize::<AllocOp, DeallocOp>(parsed_op, ctx).expect_ok(ctx);
+    let mut tmm = MallocFreeTMM;
+    bufferize(&mut tmm, parsed_op, ctx).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
     log::debug!(
@@ -603,7 +623,8 @@ fn test_float_tensor_all_binary_ops_from_rust() {
     log::debug!("pliron module parsed {}", module_op.disp(ctx));
     verify_op(&module_op, ctx).expect_ok(ctx);
 
-    bufferize::<AllocOp, DeallocOp>(parsed_op, ctx).expect_ok(ctx);
+    let mut tmm = MallocFreeTMM;
+    bufferize(&mut tmm, parsed_op, ctx).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
     apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
     log::debug!(
@@ -714,9 +735,10 @@ fn test_extract_slice_tensor_to_memref() {
         .map_err(|err| input_error_noloc!(err));
     let exec_parsed_op = exec_parsed.expect_ok(exec_ctx);
     let exec_module_op = Operation::get_op::<ModuleOp>(exec_parsed_op, exec_ctx).unwrap();
-
     verify_op(&exec_module_op, exec_ctx).expect_ok(exec_ctx);
-    bufferize::<AllocOp, DeallocOp>(exec_parsed_op, exec_ctx).expect_ok(exec_ctx);
+
+    let mut tmm = MallocFreeTMM;
+    bufferize(&mut tmm, exec_parsed_op, exec_ctx).expect_ok(exec_ctx);
     expect![[r#"
         builtin.module @test_module 
         {
@@ -822,9 +844,10 @@ fn test_extract_slice_tensor_to_memref_sequential() {
         .map_err(|err| input_error_noloc!(err));
     let exec_parsed_op = exec_parsed.expect_ok(exec_ctx);
     let exec_module_op = Operation::get_op::<ModuleOp>(exec_parsed_op, exec_ctx).unwrap();
-
     verify_op(&exec_module_op, exec_ctx).expect_ok(exec_ctx);
-    bufferize::<AllocOp, DeallocOp>(exec_parsed_op, exec_ctx).expect_ok(exec_ctx);
+
+    let mut tmm = MallocFreeTMM;
+    bufferize(&mut tmm, exec_parsed_op, exec_ctx).expect_ok(exec_ctx);
     let after_tensor_to_memref = format!("{}", exec_module_op.disp(exec_ctx));
     assert!(
         !after_tensor_to_memref.contains("tensor.extract_slice"),
@@ -927,7 +950,8 @@ fn test_insert_slice_tensor_to_memref() {
     let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
     verify_op(&module_op, ctx).expect_ok(ctx);
 
-    bufferize::<AllocOp, DeallocOp>(parsed_op, ctx).expect_ok(ctx);
+    let mut tmm = MallocFreeTMM;
+    bufferize(&mut tmm, parsed_op, ctx).expect_ok(ctx);
     let after_tensor_to_memref = format!("{}", module_op.disp(ctx));
     expect![[r#"
         builtin.module @test_module 
@@ -1071,7 +1095,8 @@ fn test_tensor_reshape_to_memref_cf_from_rust() {
     log::debug!("pliron module parsed {}", module_op.disp(ctx));
     verify_op(&module_op, ctx).expect_ok(ctx);
 
-    bufferize::<AllocOp, DeallocOp>(parsed_op, ctx).expect_ok(ctx);
+    let mut tmm = MallocFreeTMM;
+    bufferize(&mut tmm, parsed_op, ctx).expect_ok(ctx);
     let after_tensor_to_memref = format!("{}", module_op.disp(ctx));
     expect![[r#"
         builtin.module @test_module 
@@ -1130,4 +1155,135 @@ fn test_tensor_reshape_to_memref_cf_from_rust() {
     assert_eq!(f(input.build_ir_descriptor().as_ptr(), 0, 0), 1);
     assert_eq!(f(input.build_ir_descriptor().as_ptr(), 1, 0), 3);
     assert_eq!(f(input.build_ir_descriptor().as_ptr(), 2, 1), 6);
+}
+
+#[test]
+fn test_tracked_tmm_complex_tensor_computation_from_rust() {
+    init_env_logger_for_tests!();
+    let ctx = &mut Context::default();
+
+    let input_ir = r#"
+            builtin.module @test_module {
+              ^entry():
+                llvm.func @test_tensor_complex_tracked: llvm.func <llvm.void (llvm.ptr, llvm.ptr, llvm.ptr) variadic = false> [] {
+                  ^entry(arg1_p: llvm.ptr, arg2_p: llvm.ptr, res_p: llvm.ptr):
+                    arg1 = llvm.load arg1_p : tensor.ranked<4x4:builtin.integer i64>;
+                    arg2 = llvm.load arg2_p : tensor.ranked<4x4:builtin.integer i64>;
+                    mat = tensor.matmul arg1, arg2 : tensor.ranked<4x4:builtin.integer i64>;
+                    sum = tensor.add mat, arg1 : tensor.ranked<4x4:builtin.integer i64>;
+                    diff = tensor.sub sum, arg2 : tensor.ranked<4x4:builtin.integer i64>;
+                    res = tensor.mul diff, arg1 : tensor.ranked<4x4:builtin.integer i64>;
+                    llvm.store *res_p <- res;
+                    llvm.return
+                }
+            }
+            "#;
+
+    let state_stream = state_stream_from_iterator(
+        input_ir.chars(),
+        parsable::State::new(ctx, location::Source::InMemory),
+    );
+    let parsed = spaced(Operation::top_level_parser())
+        .parse(state_stream)
+        .map(|(op, _)| op)
+        .map_err(|err| input_error_noloc!(err));
+
+    let parsed_op = parsed.expect_ok(ctx);
+    let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
+    log::debug!("pliron module parsed {}", module_op.disp(ctx));
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    let mut tmm = TrackedTMM::new();
+    bufferize(&mut tmm, parsed_op, ctx).expect_ok(ctx);
+    apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
+    apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
+    log::debug!(
+        "pliron module after dialect conversion to LLVM {}",
+        module_op.disp(ctx)
+    );
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    let llvm_ctx = LLVMContext::default();
+    let llvm_ir = pliron_llvm::to_llvm_ir::convert_module(ctx, &llvm_ctx, module_op).expect_ok(ctx);
+    log::debug!("LLVM-IR generated:\n{}", llvm_ir);
+    llvm_ir
+        .verify()
+        .inspect_err(|e| eprintln!("LLVM-IR verification failed: {}", e))
+        .unwrap();
+
+    initialize_native().expect("Failed to initialize native target for LLVM execution");
+    let jit = LLVMLLJIT::new_with_default_builder().expect("Failed to create LLJIT");
+    tmm.register_runtime_symbols(&jit)
+        .expect("Failed to register runtime symbols for TrackedTMM");
+    jit.add_module(llvm_ir)
+        .expect("Failed to add module to JIT");
+    let symbol_addr = jit
+        .lookup_symbol("test_tensor_complex_tracked")
+        .expect("Failed to lookup symbol");
+    assert!(symbol_addr != 0);
+
+    let lhs_data = [1i64, 2, 3, 4, 5, 6, 7, 8, 2, 1, 0, 3, 4, 2, 1, 5];
+    let rhs_data = [2i64, 1, 0, 1, 3, 2, 1, 0, 4, 1, 2, 3, 1, 0, 2, 1];
+
+    let t1 = TensorDesciptor::new(
+        [4, 4].to_vec(),
+        std::mem::size_of::<i64>(),
+        lhs_data.as_ptr() as *const u8,
+    );
+    let t2 = TensorDesciptor::new(
+        [4, 4].to_vec(),
+        std::mem::size_of::<i64>(),
+        rhs_data.as_ptr() as *const u8,
+    );
+    let res_descr = TensorDesciptor::new(
+        [4, 4].to_vec(),
+        std::mem::size_of::<i64>(),
+        std::ptr::null::<u8>(),
+    );
+
+    let f = unsafe {
+        std::mem::transmute::<u64, extern "C" fn(*const u8, *const u8, *mut u8) -> ()>(symbol_addr)
+    };
+
+    let mut res_ir_descr = res_descr.build_ir_descriptor();
+    assert_eq!(tmm.tracked_allocations().len(), 0);
+
+    f(
+        t1.build_ir_descriptor().as_ptr(),
+        t2.build_ir_descriptor().as_ptr(),
+        res_ir_descr.as_mut_ptr(),
+    );
+
+    assert!(
+        tmm.tracked_allocations().len() >= 4,
+        "expected tracked allocations for matmul result, intermediates, and final result"
+    );
+
+    let res_tensor_descr = unsafe {
+        TensorDesciptor::from_ir_descriptor(res_ir_descr.as_ptr(), 2, std::mem::size_of::<i64>())
+    };
+    let res_slice = unsafe {
+        std::slice::from_raw_parts(
+            res_tensor_descr.aligned_ptr() as *const i64,
+            res_tensor_descr.num_elements(),
+        )
+    };
+
+    let mut expected = [0i64; 16];
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut mat = 0i64;
+            for k in 0..4 {
+                mat += lhs_data[i * 4 + k] * rhs_data[k * 4 + j];
+            }
+            let sum = mat + lhs_data[i * 4 + j];
+            let diff = sum - rhs_data[i * 4 + j];
+            expected[i * 4 + j] = diff * lhs_data[i * 4 + j];
+        }
+    }
+
+    assert_eq!(res_slice, &expected);
+
+    tmm.free_all();
+    assert_eq!(tmm.tracked_allocations().len(), 0);
 }

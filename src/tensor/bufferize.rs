@@ -4,10 +4,11 @@ use rustc_hash::FxHashSet;
 
 use pliron::{
     analyses::liveness::{Liveness, LivenessTq},
+    attribute::AttrObj,
     builtin::op_interfaces::{AtLeastNOpdsInterface, OneResultInterface, ResultNOfType},
     common_traits::Verify,
     context::{Context, Ptr},
-    derive::op_interface,
+    derive::{op_interface, op_interface_impl},
     graph::walkers::{self, IRNode},
     irbuild::{
         dialect_conversion::{
@@ -22,14 +23,17 @@ use pliron::{
     value::{Use, Value},
     verify_err_noloc,
 };
-use pliron_common_dialects::index::{ops::IndexConstantOp, types::IndexType};
-use pliron_llvm::{ToLLVMDialect, ops::FuncOp};
+use pliron_common_dialects::{
+    cf::ToCFDialect,
+    index::{ops::IndexConstantOp, types::IndexType},
+};
+use pliron_llvm::ops::FuncOp;
 use thiserror::Error;
 
 use crate::{
     memref::{
         ToMemrefType,
-        ops::{CopyOp, DimOp},
+        ops::{AllocOp, CopyOp, DeallocOp, DimOp},
         type_interfaces::{Dimension, ShapedType},
         types::RankedMemrefType,
     },
@@ -169,7 +173,7 @@ pub trait BufferizableOpInterface {
         &self,
         ctx: &mut Context,
         rewriter: &mut DialectConversionRewriter,
-        bufferizer_callbacks: &dyn BufferizerCallbacks,
+        tmm: &mut dyn TensorMemoryManager,
         operands_info: &OperandsInfo,
     ) -> Result<()>;
 
@@ -211,11 +215,13 @@ pub trait BufferizableOpInterface {
 /// For a simple malloc-like allocation, use [AllocOp](crate::memref::ops::AllocOp).
 #[op_interface]
 pub trait MemrefAllocOpInterface:
-    OneResultInterface + ResultNOfType<0, RankedMemrefType> + ToLLVMDialect
+    OneResultInterface + ResultNOfType<0, RankedMemrefType> + ToCFDialect
 {
     /// Create a new [Self] to allocate a buffer for `tensor_ty` with given `dynamic_sizes`.
+    /// Any IR static information that may be needed can be passed via `static_info`.
     fn try_new(
         ctx: &mut Context,
+        static_info: Option<AttrObj>,
         memref_ty: TypePtr<RankedMemrefType>,
         dynamic_sizes: Vec<Value>,
     ) -> Result<Self>
@@ -233,9 +239,10 @@ pub trait MemrefAllocOpInterface:
 /// An [Op] to Deallocate a buffer (memref). For a simple free-like deallocation,
 /// use [DeallocOp](crate::memref::ops::DeallocOp).
 #[op_interface]
-pub trait MemrefDeallocOpInterface: AtLeastNOpdsInterface<1> + ToLLVMDialect {
+pub trait MemrefDeallocOpInterface: AtLeastNOpdsInterface<1> + ToCFDialect {
     /// Create a new [Self] to deallocate the buffer in `memref`.
-    fn try_new(ctx: &mut Context, memref: Value) -> Result<Self>
+    /// Any IR static information that may be needed can be passed via `static_info`.
+    fn try_new(ctx: &mut Context, static_info: Option<AttrObj>, memref: Value) -> Result<Self>
     where
         Self: Sized;
 
@@ -247,37 +254,41 @@ pub trait MemrefDeallocOpInterface: AtLeastNOpdsInterface<1> + ToLLVMDialect {
     }
 }
 
-/// Callbacks provided to [BufferizableOpInterface::rewrite] to create alloc and dealloc ops
-pub trait BufferizerCallbacks {
+/// Provided to [BufferizableOpInterface::rewrite] to create alloc and dealloc ops.
+/// For a simple implementation that creates malloc-like allocs and free-like deallocs,
+/// use [MallocFreeTMM].
+pub trait TensorMemoryManager {
+    /// Create a new memref allocation op for the given memref type and dynamic sizes.
     fn create_memref_alloc(
-        &self,
+        &mut self,
         ctx: &mut Context,
         memref_ty: TypePtr<RankedMemrefType>,
         dynamic_sizes: Vec<Value>,
     ) -> Result<Box<dyn MemrefAllocOpInterface>>;
 
+    /// Create a new memref deallocation op for the given memref.
     fn create_memref_dealloc(
-        &self,
+        &mut self,
         ctx: &mut Context,
         memref: Value,
     ) -> Result<Box<dyn MemrefDeallocOpInterface>>;
+
+    /// Register runtime symbols for LLVM JIT.
+    fn register_runtime_symbols(&self, jit: &pliron_llvm::llvm_sys::lljit::LLVMLLJIT)
+    -> Result<()>;
 }
 
 /// A helper struct that implements [DialectConversion]
 /// to bufferize from tensor semantics to memref semantics.
-struct Bufferizer<A: MemrefAllocOpInterface, D: MemrefDeallocOpInterface> {
-    alloc_op: std::marker::PhantomData<A>,
-    /// TODO: Use this to insert deallocs for dead buffers.
-    dealloc_op: std::marker::PhantomData<D>,
+struct Bufferizer<'tmm, TMM: TensorMemoryManager> {
+    tmm: &'tmm mut TMM,
     /// Set of operands that can be bufferized in-place (i.e., without copy).
     /// Whether a result (that alises to this operand) needs a new allocation
     /// or not is left to the op's rewrite method.
     in_place_bufferizable_operands: FxHashSet<Use<Value>>,
 }
 
-impl<A: MemrefAllocOpInterface, D: MemrefDeallocOpInterface> DialectConversion
-    for Bufferizer<A, D>
-{
+impl<'tmm, TMM: TensorMemoryManager> DialectConversion for Bufferizer<'tmm, TMM> {
     fn can_convert_op(&self, ctx: &Context, op: Ptr<Operation>) -> bool {
         op_impls::<dyn BufferizableOpInterface>(Operation::get_op_dyn(op, ctx).as_ref())
             || Operation::get_op::<FuncOp>(op, ctx).is_some()
@@ -332,9 +343,11 @@ impl<A: MemrefAllocOpInterface, D: MemrefDeallocOpInterface> DialectConversion
                     }
                     dynamic_sizes
                 };
-            let alloc_op = A::try_new(ctx, ranked_memref_ty, dynamic_sizes)?;
+            let alloc_op = self
+                .tmm
+                .create_memref_alloc(ctx, ranked_memref_ty, dynamic_sizes)?;
             let new_buffer = alloc_op.get_result(ctx);
-            rewriter.append_op(ctx, alloc_op);
+            rewriter.append_operation(ctx, alloc_op.get_operation());
 
             // Copy the operand buffer to the new buffer.
             let copy_op = CopyOp::new(ctx, new_buffer, opd.get_def(ctx));
@@ -343,41 +356,8 @@ impl<A: MemrefAllocOpInterface, D: MemrefDeallocOpInterface> DialectConversion
             Operation::replace_operand(op, ctx, opd.opd_idx, new_buffer);
         }
 
-        struct BufferizerCallbacksAD<A: MemrefAllocOpInterface, D: MemrefDeallocOpInterface> {
-            alloc_op: std::marker::PhantomData<A>,
-            dealloc_op: std::marker::PhantomData<D>,
-        }
-        impl<A: MemrefAllocOpInterface, D: MemrefDeallocOpInterface> BufferizerCallbacks
-            for BufferizerCallbacksAD<A, D>
-        {
-            fn create_memref_alloc(
-                &self,
-                ctx: &mut Context,
-                memref_ty: TypePtr<RankedMemrefType>,
-                dynamic_sizes: Vec<Value>,
-            ) -> Result<Box<dyn MemrefAllocOpInterface>> {
-                Ok(Box::new(A::try_new(ctx, memref_ty, dynamic_sizes)?))
-            }
-
-            fn create_memref_dealloc(
-                &self,
-                ctx: &mut Context,
-                memref: Value,
-            ) -> Result<Box<dyn MemrefDeallocOpInterface>> {
-                Ok(Box::new(D::try_new(ctx, memref)?))
-            }
-        }
-
         // Rewrite the op to use memref semantics.
-        op_iface.rewrite(
-            ctx,
-            rewriter,
-            &BufferizerCallbacksAD::<A, D> {
-                alloc_op: std::marker::PhantomData,
-                dealloc_op: std::marker::PhantomData,
-            },
-            _operands_info,
-        )
+        op_iface.rewrite(ctx, rewriter, self.tmm, _operands_info)
     }
 
     fn can_convert_type(&self, ctx: &Context, ty: Ptr<TypeObj>) -> bool {
@@ -404,7 +384,8 @@ impl<A: MemrefAllocOpInterface, D: MemrefDeallocOpInterface> DialectConversion
 ///    Replace the operand with the new buffer.
 ///    (b): If the operand is not live after the op: No action.
 /// 3. Rewrite the IR using dialect conversion, which invokes [BufferizableOpInterface::rewrite].
-pub fn bufferize<A: MemrefAllocOpInterface, D: MemrefDeallocOpInterface>(
+pub fn bufferize<TMM: TensorMemoryManager>(
+    tmm: &mut TMM,
     op: Ptr<Operation>,
     ctx: &mut Context,
 ) -> Result<()> {
@@ -465,10 +446,61 @@ pub fn bufferize<A: MemrefAllocOpInterface, D: MemrefDeallocOpInterface>(
         analyze_op,
     );
 
-    let mut bufferizer = Bufferizer::<A, D> {
-        alloc_op: std::marker::PhantomData,
-        dealloc_op: std::marker::PhantomData,
+    let mut bufferizer = Bufferizer::<TMM> {
+        tmm,
         in_place_bufferizable_operands: analysis.in_place_bufferizable_operands,
     };
     apply_dialect_conversion(ctx, &mut bufferizer, op)
+}
+
+#[op_interface_impl]
+impl MemrefAllocOpInterface for AllocOp {
+    fn try_new(
+        ctx: &mut Context,
+        _static_info: Option<AttrObj>,
+        memref_ty: TypePtr<RankedMemrefType>,
+        dynamic_sizes: Vec<Value>,
+    ) -> Result<Self> {
+        Ok(Self::new(ctx, memref_ty, dynamic_sizes))
+    }
+}
+
+#[op_interface_impl]
+impl MemrefDeallocOpInterface for DeallocOp {
+    fn try_new(ctx: &mut Context, _static_info: Option<AttrObj>, memref: Value) -> Result<Self> {
+        Ok(Self::new(ctx, memref))
+    }
+}
+
+/// A simple [TensorMemoryManager] implementation based on [AllocOp] and [DeallocOp].
+/// Effectively calls `malloc` and `free` and does no other book-keeping.
+pub struct MallocFreeTMM;
+
+impl TensorMemoryManager for MallocFreeTMM {
+    fn create_memref_alloc(
+        &mut self,
+        ctx: &mut Context,
+        memref_ty: TypePtr<RankedMemrefType>,
+        dynamic_sizes: Vec<Value>,
+    ) -> Result<Box<dyn MemrefAllocOpInterface>> {
+        let alloc_op = crate::memref::ops::AllocOp::try_new(ctx, None, memref_ty, dynamic_sizes)?;
+        Ok(Box::new(alloc_op))
+    }
+
+    fn create_memref_dealloc(
+        &mut self,
+        ctx: &mut Context,
+        memref: Value,
+    ) -> Result<Box<dyn MemrefDeallocOpInterface>> {
+        let dealloc_op = crate::memref::ops::DeallocOp::try_new(ctx, None, memref)?;
+        Ok(Box::new(dealloc_op))
+    }
+
+    fn register_runtime_symbols(
+        &self,
+        _jit: &pliron_llvm::llvm_sys::lljit::LLVMLLJIT,
+    ) -> Result<()> {
+        // No custom runtime symbols to register for malloc/free-based bufferization.
+        Ok(())
+    }
 }
