@@ -112,6 +112,127 @@ fn test_tensor_to_memref_conversion() {
     }
 }
 
+fn test_successor_operand_aliasing_needs_copy_helper(input_ir: &str) {
+    init_env_logger_for_tests!();
+    let ctx = &mut Context::new();
+
+    let state_stream = state_stream_from_iterator(
+        input_ir.chars(),
+        parsable::State::new(ctx, location::Source::InMemory),
+    );
+    let parsed = spaced(Operation::top_level_parser())
+        .parse(state_stream)
+        .map(|(op, _)| op)
+        .map_err(|err| input_error_noloc!(err));
+
+    let parsed_op = parsed.expect_ok(ctx);
+    let module_op = Operation::get_op::<ModuleOp>(parsed_op, ctx).unwrap();
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    let mut tmm = MallocFreeTMM;
+    bufferize(&mut tmm, parsed_op, ctx).expect_ok(ctx);
+    apply_dialect_conversion(ctx, &mut MemrefToCF, parsed_op).expect_ok(ctx);
+    apply_dialect_conversion(ctx, &mut CFToLLVM, parsed_op).expect_ok(ctx);
+    verify_op(&module_op, ctx).expect_ok(ctx);
+
+    let llvm_ctx = LLVMContext::default();
+    let llvm_ir = pliron_llvm::to_llvm_ir::convert_module(ctx, &llvm_ctx, module_op).expect_ok(ctx);
+    llvm_ir
+        .verify()
+        .inspect_err(|e| eprintln!("LLVM-IR verification failed: {}", e))
+        .unwrap();
+
+    initialize_native().expect("Failed to initialize native target for LLVM execution");
+    let jit = LLVMLLJIT::new_with_default_builder().expect("Failed to create LLJIT");
+    jit.add_module(llvm_ir)
+        .expect("Failed to add module to JIT");
+    let symbol_addr = jit
+        .lookup_symbol("test_successor_operand_aliasing")
+        .expect("Failed to lookup symbol");
+    assert!(symbol_addr != 0);
+
+    let f = unsafe { std::mem::transmute::<u64, fn(bool) -> i64>(symbol_addr) };
+
+    let result = f(false);
+
+    // Expected with correct bufferization:
+    //   z is original x = [1, 2, 3, 4]
+    //   y is x with index 0 updated to 10 => [10, 2, 3, 4]
+    //   sum[0] = 1 + 10 = 11
+    assert_eq!(result, 11);
+}
+
+#[test]
+fn test_successor_operand_aliasing_needs_copy_0() {
+    let input_ir = r#"
+        builtin.module @test_module {
+            ^entry():
+                llvm.func @test_successor_operand_aliasing: llvm.func <builtin.integer i64 (builtin.integer i1) variadic = false> [] {
+                    ^entry(flag: builtin.integer i1):
+                        x = tensor.generate : tensor.ranked<4:builtin.integer i64> {
+                            ^entry(i_1 : index.index):
+                                i_int = index.to_integer i_1 to builtin.integer i64;
+                                one = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
+                                x_elem = llvm.add i_int, one <{nsw = false, nuw = false}> : builtin.integer i64;
+                                memref.yield x_elem
+                        };
+                        llvm.br ^block_b(x)
+
+                    ^block_b(z: tensor.ranked<4:builtin.integer i64>):
+                        src = tensor.generate : tensor.ranked<1:builtin.integer i64> {
+                            ^entry(i_2 : index.index):
+                                ten = llvm.constant <builtin.integer <10: i64>> : builtin.integer i64;
+                                memref.yield ten
+                        };
+                        y = tensor.insert_slice src into z [0] [1] [1] : tensor.ranked<4:builtin.integer i64>;
+                        sum = tensor.add x, y : tensor.ranked<4:builtin.integer i64>;
+                        zero_idx_i64 = llvm.constant <builtin.integer <0: i64>> : builtin.integer i64;
+                        zero_idx = index.from_integer zero_idx_i64 : index.index;
+                        res = tensor.extract sum[zero_idx]: builtin.integer i64;
+                        llvm.return res
+                }
+        }
+        "#;
+    test_successor_operand_aliasing_needs_copy_helper(input_ir);
+}
+
+#[test]
+fn test_successor_operand_aliasing_needs_copy_1() {
+    let input_ir = r#"
+        builtin.module @test_module {
+            ^entry():
+                llvm.func @test_successor_operand_aliasing: llvm.func <builtin.integer i64 (builtin.integer i1) variadic = false> [] {
+                    ^entry(flag: builtin.integer i1):
+                        x = tensor.generate : tensor.ranked<4:builtin.integer i64> {
+                            ^entry(i_1 : index.index):
+                                i_int = index.to_integer i_1 to builtin.integer i64;
+                                one = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
+                                x_elem = llvm.add i_int, one <{nsw = false, nuw = false}> : builtin.integer i64;
+                                memref.yield x_elem
+                        };
+                        llvm.cond_br if flag ^block_b(x, x) else ^block_c(x, x)
+
+                    ^block_c(z_c: tensor.ranked<4:builtin.integer i64>, x_c: tensor.ranked<4:builtin.integer i64>):
+                        src = tensor.generate : tensor.ranked<1:builtin.integer i64> {
+                            ^entry(i_2 : index.index):
+                                ten = llvm.constant <builtin.integer <10: i64>> : builtin.integer i64;
+                                memref.yield ten
+                        };
+                        y = tensor.insert_slice src into x_c [0] [1] [1] : tensor.ranked<4:builtin.integer i64>;
+                        llvm.br ^block_b(z_c, y)
+
+                    ^block_b(z: tensor.ranked<4:builtin.integer i64>, y_b: tensor.ranked<4:builtin.integer i64>):
+                        sum = tensor.add z, y_b : tensor.ranked<4:builtin.integer i64>;
+                        zero_idx_i64 = llvm.constant <builtin.integer <0: i64>> : builtin.integer i64;
+                        zero_idx = index.from_integer zero_idx_i64 : index.index;
+                        res = tensor.extract sum[zero_idx]: builtin.integer i64;
+                        llvm.return res
+                }
+        }
+        "#;
+    test_successor_operand_aliasing_needs_copy_helper(input_ir);
+}
+
 #[test]
 fn test_int_tensor_from_rust() {
     init_env_logger_for_tests!();

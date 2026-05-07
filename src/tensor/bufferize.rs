@@ -1,11 +1,38 @@
 //! Tensor semantics -> memref semantics
+//!
+//! The function [bufferize], is the main entry point.
+//!
+//! The bufferization algorithm relies on maintaining the invariant that a buffer (memref)
+//! is mapped to at most one tensor value at any point in the program.
+//!
+//! The inverse need not hold: A tensor may be backed by more than one buffer at a point.
+//! For example, a tensor block arg may be backed by different buffers based on control-flow.
+//!
+//! Aliases may be created in the following ways:
+//! 1. An operand of an op implementing [BufferizableOpInterface] may be specified to alias
+//!    with a result of the same op. The algorithm will insert copies (if it deems necessary)
+//!    and update the operand with the copy buffer, allowing the rewrite method to reuse the
+//!    operand buffer for the result, safely. The rewrite method of the op, must, however ensure
+//!    that it doesn't create new aliases that violate the invariant. For example, multiple results
+//!    must not bufferize to the same memref.
+//! 2. A tensor value passed as a successor operand to a successor block argument creates an
+//!    implicit alias between the value and the successor block argument. If the value is live-in
+//!    at the successor block or is passed to multiple argument positions of the same successor,
+//!    the bufferizer will insert a copy to a new buffer and pass that to the successor instead,
+//!    to avoid violating the invariant.
+//!    *Note*: Two tensors T1 and T2 that may be passed from different predecessor blocks to the
+//!    same successor block argument, will not be alias. Even if both T1 and T2 are live at the
+//!    successor block, either T1 dominates T2 or T2 dominates T1, preventing them from being
+//!    assigned to the same buffer previously.
 
 use rustc_hash::FxHashSet;
 
 use pliron::{
     analyses::liveness::{Liveness, LivenessTq},
     attribute::AttrObj,
-    builtin::op_interfaces::{AtLeastNOpdsInterface, OneResultInterface, ResultNOfType},
+    builtin::op_interfaces::{
+        AtLeastNOpdsInterface, BranchOpInterface, OneResultInterface, ResultNOfType,
+    },
     common_traits::Verify,
     context::{Context, Ptr},
     derive::{op_interface, op_interface_impl},
@@ -165,6 +192,10 @@ pub trait BufferizableOpInterface {
     /// Non-aliasing results will need to be be bufferized (by allocating a new buffer).
     /// Aliasing results can assume that it's safe to reuse operand buffers.
     ///
+    /// The rewrite must maintain the invariant that a buffer (memref) is mapped
+    /// to at most one tensor value at any point in the program. This means that,
+    /// for example, multiple results of the op must not bufferize to the same memref.
+    ///
     /// `operands_info` semantics are as in [DialectConversion::rewrite], and can be used
     /// to get pre-conversion operand types.
     fn rewrite(
@@ -284,12 +315,20 @@ struct Bufferizer<'tmm, TMM: TensorMemoryManager> {
     /// Whether a result (that alises to this operand) needs a new allocation
     /// or not is left to the op's rewrite method.
     in_place_bufferizable_operands: FxHashSet<Use<Value>>,
+    /// Set of successor operands (identified by their operand index in the branch op)
+    /// that must be copied before being passed to a successor block, to avoid
+    /// violating the invariant that a buffer maps to at most one tensor value.
+    successor_operands_needing_copy: FxHashSet<Use<Value>>,
 }
 
 impl<'tmm, TMM: TensorMemoryManager> DialectConversion for Bufferizer<'tmm, TMM> {
     fn can_convert_op(&self, ctx: &Context, op: Ptr<Operation>) -> bool {
         op_impls::<dyn BufferizableOpInterface>(Operation::get_op_dyn(op, ctx).as_ref())
             || Operation::get_op::<FuncOp>(op, ctx).is_some()
+            || op
+                .deref(ctx)
+                .operands_as_uses()
+                .any(|u| self.successor_operands_needing_copy.contains(&u))
     }
 
     fn rewrite(
@@ -303,44 +342,55 @@ impl<'tmm, TMM: TensorMemoryManager> DialectConversion for Bufferizer<'tmm, TMM>
         if let Some(func_op) = Operation::get_op::<FuncOp>(op, ctx) {
             return lower_func_op_to_llvm(&func_op, ctx);
         }
-        let op_dyn = Operation::get_op_dyn(op, ctx);
-        let op_iface = op_cast::<dyn BufferizableOpInterface>(op_dyn.as_ref())
-            .expect("Failed to cast op to BufferizableOpInterface");
-        // If any operand aliases to a result, we may need to create a new buffer for that operand.
-        let aliases = op_iface.get_operand_result_aliases(ctx);
 
-        let operands = op.deref(ctx).operands_as_uses().collect::<Vec<_>>();
-        for opd in operands {
-            let aliasing_results = Alias::get_aliases_for_operand(&aliases, opd);
-            // If this doesn't alias with a result or is known to be safe to bufferize in-place:
+        let op_dyn = Operation::get_op_dyn(op, ctx);
+        let op_iface_opt = op_cast::<dyn BufferizableOpInterface>(op_dyn.as_ref());
+        let aliases_opt = op_iface_opt.map(|iface| iface.get_operand_result_aliases(ctx));
+
+        // Two kinds of operands need to be copied to a new buffer:
+        let mut opds_needing_copy = FxHashSet::default();
+        // 1. Successor operands that were previously identified to need a copy.
+        // 2. Operands that alias with a result but weren't marked safe for in-place bufferization.
+        for opd in op.deref(ctx).operands_as_uses() {
+            if self.successor_operands_needing_copy.contains(&opd) {
+                opds_needing_copy.insert(opd);
+            }
+            let Some(aliases) = &aliases_opt else {
+                continue;
+            };
+            let aliasing_results = Alias::get_aliases_for_operand(aliases, opd);
             if aliasing_results.is_empty() || self.in_place_bufferizable_operands.contains(&opd) {
                 continue;
             }
+        }
+
+        for opd in opds_needing_copy {
             // Create a new buffer for the operand.
             let opd_ty = opd.get_type(ctx);
             let ranked_memref_ty: TypePtr<RankedMemrefType> = TypePtr::from_ptr(opd_ty, ctx)?;
-            let dynamic_sizes =
-                if let Some(dynamic_sizes) = op_iface.get_dynamic_dimensions(ctx, opd) {
-                    dynamic_sizes
-                } else {
-                    // If dynamic dimensions are not provided by the op, use `memref.dim` to query them (less efficient).
-                    let mut dynamic_sizes = Vec::new();
-                    let shape = {
-                        let ranked_memref_ty = ranked_memref_ty.deref(ctx);
-                        ranked_memref_ty.shape().clone()
-                    };
-                    for (dim_idx, dim) in shape.iter().enumerate() {
-                        if matches!(dim, Dimension::Static(_)) {
-                            continue;
-                        }
-                        let dim_const = IndexConstantOp::new(ctx, dim_idx);
-                        rewriter.append_op(ctx, dim_const);
-                        let dim_size = DimOp::new(ctx, opd.get_def(ctx), dim_const.get_result(ctx))
-                            .get_result(ctx);
-                        dynamic_sizes.push(dim_size);
-                    }
-                    dynamic_sizes
+            let dynamic_sizes = if let Some(dynamic_sizes) =
+                op_iface_opt.and_then(|iface| iface.get_dynamic_dimensions(ctx, opd))
+            {
+                dynamic_sizes
+            } else {
+                // If dynamic dimensions are not provided by the op, use `memref.dim` to query them (less efficient).
+                let mut dynamic_sizes = Vec::new();
+                let shape = {
+                    let ranked_memref_ty = ranked_memref_ty.deref(ctx);
+                    ranked_memref_ty.shape().clone()
                 };
+                for (dim_idx, dim) in shape.iter().enumerate() {
+                    if matches!(dim, Dimension::Static(_)) {
+                        continue;
+                    }
+                    let dim_const = IndexConstantOp::new(ctx, dim_idx);
+                    rewriter.append_op(ctx, dim_const);
+                    let dim_size = DimOp::new(ctx, opd.get_def(ctx), dim_const.get_result(ctx))
+                        .get_result(ctx);
+                    dynamic_sizes.push(dim_size);
+                }
+                dynamic_sizes
+            };
             let alloc_op = self
                 .tmm
                 .create_memref_alloc(ctx, ranked_memref_ty, dynamic_sizes)?;
@@ -355,7 +405,10 @@ impl<'tmm, TMM: TensorMemoryManager> DialectConversion for Bufferizer<'tmm, TMM>
         }
 
         // Rewrite the op to use memref semantics.
-        op_iface.rewrite(ctx, rewriter, self.tmm, _operands_info)
+        if let Some(op_iface) = op_iface_opt {
+            op_iface.rewrite(ctx, rewriter, self.tmm, _operands_info)?;
+        }
+        Ok(())
     }
 
     fn can_convert_type(&self, ctx: &Context, ty: Ptr<TypeObj>) -> bool {
@@ -381,12 +434,11 @@ impl<'tmm, TMM: TensorMemoryManager> DialectConversion for Bufferizer<'tmm, TMM>
 ///    and, if necessary, copy the operand buffer to it.
 ///    Replace the operand with the new buffer.
 ///    (b): If the operand is not live after the op: No action.
+/// 2. Operands passed as successor operands to a successor block create aliases.
+///    If any such operand is live-in at the successor block or is passed to
+///    multiple argument positions of the same successor, copy the operand to a
+///    new buffer and pass that to the successor instead.
 /// 3. Rewrite the IR using dialect conversion, which invokes [BufferizableOpInterface::rewrite].
-///
-/// The invariant maintained is that, a buffer (memref) is at most mapped to
-/// one tensor value at any point in the program. This also means that an operation
-/// implementing [BufferizableOpInterface] must not break this invariant in its rewrite method.
-/// For example, multiple results of the same op must not bufferize to the same memref.
 pub fn bufferize<TMM: TensorMemoryManager>(
     tmm: &mut TMM,
     op: Ptr<Operation>,
@@ -395,6 +447,7 @@ pub fn bufferize<TMM: TensorMemoryManager>(
     struct InPlaceBufferizationAnalysis {
         liveness: Liveness<LivenessTq>,
         in_place_bufferizable_operands: FxHashSet<Use<Value>>,
+        successor_operands_needing_copy: FxHashSet<Use<Value>>,
     }
 
     fn analyze_op(ctx: &Context, state: &mut InPlaceBufferizationAnalysis, node: IRNode) {
@@ -403,6 +456,58 @@ pub fn bufferize<TMM: TensorMemoryManager>(
         };
 
         let op_dyn = Operation::get_op_dyn(op, ctx);
+
+        // Successor operand analysis: passing a tensor value as a successor operand
+        // creates an implicit alias between the value and the successor block argument.
+        // We detect two cases that violate the bufferization invariant:
+        //   (a) The value is live-in at the successor block (direct use there besides the block arg).
+        //   (b) The same value is passed to multiple argument positions of the same successor.
+        if op.deref(ctx).get_num_successors() > 0 {
+            if let Some(branch_iface) = op_cast::<dyn BranchOpInterface>(op_dyn.as_ref()) {
+                for opd_use in op.deref(ctx).operands_as_uses() {
+                    let val = opd_use.get_def(ctx);
+                    if !type_impls::<dyn ToMemrefType>(&**val.get_type(ctx).deref(ctx)) {
+                        continue;
+                    }
+                    let mut needs_copy = false;
+                    for succ_idx in 0..op.deref(ctx).get_num_successors() {
+                        let succ_opds = branch_iface.successor_operands(ctx, succ_idx);
+                        if !succ_opds.contains(&val) {
+                            continue;
+                        }
+                        // (a) Liveness check.
+                        let succ_block = op.deref(ctx).get_successor(succ_idx);
+                        if state.liveness.is_live_at_point(
+                            ctx,
+                            val,
+                            OpInsertionPoint::AtBlockStart(succ_block),
+                        ) {
+                            needs_copy = true;
+                            break;
+                        }
+                        // (b) Duplicate check: value appears more than once in this successor's args.
+                        if succ_opds.iter().filter(|&&v| v == val).count() >= 2 {
+                            needs_copy = true;
+                            break;
+                        }
+                    }
+                    if needs_copy {
+                        state.successor_operands_needing_copy.insert(opd_use);
+                    }
+                }
+            } else {
+                // Without BranchOpInterface we cannot identify which operands are successor
+                // operands, so conservatively copy all tensor-typed operands.
+                for opd_use in op.deref(ctx).operands_as_uses() {
+                    let val = opd_use.get_def(ctx);
+                    if type_impls::<dyn ToMemrefType>(&**val.get_type(ctx).deref(ctx)) {
+                        state.successor_operands_needing_copy.insert(opd_use);
+                    }
+                }
+            }
+        }
+
+        // In-place bufferization analysis for ops implementing [BufferizableOpInterface].
         let Some(op_iface) = op_cast::<dyn BufferizableOpInterface>(op_dyn.as_ref()) else {
             return;
         };
@@ -450,6 +555,7 @@ pub fn bufferize<TMM: TensorMemoryManager>(
     let mut analysis = InPlaceBufferizationAnalysis {
         liveness: Liveness::<LivenessTq>::default(),
         in_place_bufferizable_operands: FxHashSet::default(),
+        successor_operands_needing_copy: FxHashSet::default(),
     };
 
     walkers::uninterruptible::immutable::walk_op(
@@ -463,6 +569,7 @@ pub fn bufferize<TMM: TensorMemoryManager>(
     let mut bufferizer = Bufferizer::<TMM> {
         tmm,
         in_place_bufferizable_operands: analysis.in_place_bufferizable_operands,
+        successor_operands_needing_copy: analysis.successor_operands_needing_copy,
     };
     apply_dialect_conversion(ctx, &mut bufferizer, op)
 }
