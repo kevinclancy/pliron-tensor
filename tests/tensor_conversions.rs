@@ -867,10 +867,10 @@ fn test_extract_slice_tensor_to_memref() {
             llvm.func @test_extract_slice_runtime: llvm.func <llvm.void (llvm.ptr , llvm.ptr ) variadic = false>
               [] 
             {
-              ^entry_block1v1(src_p_block1v1_arg0: llvm.ptr , out_p_block1v1_arg1: llvm.ptr ) !1:
-                src_op4v1_res0 = llvm.load src_p_block1v1_arg0  : memref.ranked <10x20 : builtin.integer i64> !2;
-                $op6v3_res0 = memref.subview src_op4v1_res0 [0, 2] [5, 10] [1, 2] : memref.ranked <5x10 : builtin.integer i64> !3;
-                llvm.store *out_p_block1v1_arg1 <- op6v3_res0  !4;
+              ^entry_block1v1(src_p_v4: llvm.ptr , out_p_v5: llvm.ptr ) !1:
+                src_v1 = llvm.load src_p_v4  : memref.ranked <10x20 : builtin.integer i64> !2;
+                $v6 = memref.subview src_v1 [0, 2] [5, 10] [1, 2] : memref.ranked <5x10 : builtin.integer i64> !3;
+                llvm.store *out_p_v5 <- v6  !4;
                 llvm.return  !5
             } !6
         }"#]].assert_eq(&exec_module_op.disp(exec_ctx).to_string());
@@ -1081,12 +1081,12 @@ fn test_insert_slice_tensor_to_memref() {
             llvm.func @test_insert_slice_runtime: llvm.func <llvm.void (llvm.ptr , llvm.ptr , llvm.ptr ) variadic = false>
               [] 
             {
-              ^entry_block1v1(src_p_block1v1_arg0: llvm.ptr , dst_p_block1v1_arg1: llvm.ptr , out_p_block1v1_arg2: llvm.ptr ) !1:
-                src_op4v1_res0 = llvm.load src_p_block1v1_arg0  : memref.ranked <5x10 : builtin.integer i64> !2;
-                dst_op6v1_res0 = llvm.load dst_p_block1v1_arg1  : memref.ranked <10x20 : builtin.integer i64> !3;
-                $op8v3_res0 = memref.subview dst_op6v1_res0 [0, 2] [5, 10] [1, 2] : memref.ranked <5x10 : builtin.integer i64>;
-                memref.copy op8v3_res0 <- src_op4v1_res0;
-                llvm.store *out_p_block1v1_arg2 <- dst_op6v1_res0  !4;
+              ^entry_block1v1(src_p_v6: llvm.ptr , dst_p_v7: llvm.ptr , out_p_v8: llvm.ptr ) !1:
+                src_v1 = llvm.load src_p_v6  : memref.ranked <5x10 : builtin.integer i64> !2;
+                dst_v3 = llvm.load dst_p_v7  : memref.ranked <10x20 : builtin.integer i64> !3;
+                $v9 = memref.subview dst_v3 [0, 2] [5, 10] [1, 2] : memref.ranked <5x10 : builtin.integer i64>;
+                memref.copy v9 <- src_v1;
+                llvm.store *out_p_v8 <- dst_v3  !4;
                 llvm.return  !5
             } !6
         }"#]].assert_eq(&after_tensor_to_memref);
@@ -1226,13 +1226,13 @@ fn test_tensor_reshape_to_memref_cf_from_rust() {
             llvm.func @test_tensor_reshape_extract: llvm.func <builtin.integer i64(llvm.ptr , builtin.integer i64, builtin.integer i64) variadic = false>
               [] 
             {
-              ^entry_block1v1(arg_p_block1v1_arg0: llvm.ptr , i_res_block1v1_arg1: builtin.integer i64, j_res_block1v1_arg2: builtin.integer i64) !1:
-                arg_op4v1_res0 = llvm.load arg_p_block1v1_arg0  : memref.ranked <2x3 : builtin.integer i64> !2;
-                op8v3_res0 = memref.reshape arg_op4v1_res0 : memref.ranked <3x2 : builtin.integer i64> !3;
-                i_idx_op7v1_res0 = index.from_integer i_res_block1v1_arg1 : index.index  !4;
-                j_idx_op9v1_res0 = index.from_integer j_res_block1v1_arg2 : index.index  !5;
-                memref.load op8v3_res0[i_idx_op7v1_res0, j_idx_op9v1_res0] : builtin.integer i64 !6;
-                llvm.return op5v3_res0 !7
+              ^entry_block1v1(arg_p_v8: llvm.ptr , i_res_v9: builtin.integer i64, j_res_v10: builtin.integer i64) !1:
+                arg_v1 = llvm.load arg_p_v8  : memref.ranked <2x3 : builtin.integer i64> !2;
+                v11 = memref.reshape arg_v1 : memref.ranked <3x2 : builtin.integer i64> !3;
+                i_idx_v4 = index.from_integer i_res_v9 : index.index  !4;
+                j_idx_v6 = index.from_integer j_res_v10 : index.index  !5;
+                memref.load v11[i_idx_v4, j_idx_v6] : builtin.integer i64 !6;
+                llvm.return v12 !7
             } !8
         }"#]].assert_eq(&after_tensor_to_memref);
 

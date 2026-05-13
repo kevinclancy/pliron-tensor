@@ -70,87 +70,87 @@ fn test_alloc_generate() {
             llvm.func @test_alloc_generate: llvm.func <builtin.integer i64(builtin.integer i64, builtin.integer i64) variadic = false>
               [] 
             {
-              ^entry_block2v1(i_res_block2v1_arg0: builtin.integer i64, j_res_block2v1_arg1: builtin.integer i64) !1:
-                op43v3_res0 = llvm.constant <builtin.integer <16: i64>> : builtin.integer i64;
-                op9v5_res0 = llvm.constant <builtin.integer <16: i64>> : builtin.integer i64;
-                op4v7_res0 = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
-                op15v3_res0 = llvm.constant <builtin.integer <16: i64>> : builtin.integer i64;
-                op16v3_res0 = llvm.constant <builtin.integer <256: i64>> : builtin.integer i64;
-                op18v1_res0 = llvm.zero : llvm.ptr ;
-                op19v1_res0 = llvm.gep <builtin.integer i64> (op18v1_res0)[Constant(1)] : llvm.ptr ;
-                op20v1_res0 = llvm.ptrtoint op19v1_res0 to builtin.integer i64;
-                op21v1_res0 = llvm.mul op20v1_res0, op16v3_res0 <{nsw=false,nuw=false}>: builtin.integer i64;
-                op23v1_res0 = llvm.call @malloc (op21v1_res0) : llvm.func <llvm.ptr (builtin.integer i64) variadic = false>;
-                op17v3_res0 = llvm.constant <builtin.integer <0: i64>> : builtin.integer i64;
-                op25v1_res0 = llvm.undef : llvm.struct <{ llvm.ptr , llvm.ptr , builtin.integer i64, llvm.array [2 x builtin.integer i64], llvm.array [2 x builtin.integer i64] }>;
-                op26v1_res0 = llvm.insert_value op25v1_res0[0], op23v1_res0 : llvm.struct <{ llvm.ptr , llvm.ptr , builtin.integer i64, llvm.array [2 x builtin.integer i64], llvm.array [2 x builtin.integer i64] }>;
-                op27v1_res0 = llvm.insert_value op26v1_res0[1], op23v1_res0 : llvm.struct <{ llvm.ptr , llvm.ptr , builtin.integer i64, llvm.array [2 x builtin.integer i64], llvm.array [2 x builtin.integer i64] }>;
-                op28v1_res0 = llvm.insert_value op27v1_res0[2], op17v3_res0 : llvm.struct <{ llvm.ptr , llvm.ptr , builtin.integer i64, llvm.array [2 x builtin.integer i64], llvm.array [2 x builtin.integer i64] }>;
-                op29v1_res0 = llvm.undef : llvm.array [2 x builtin.integer i64];
-                op30v1_res0 = llvm.insert_value op29v1_res0[0], op43v3_res0 : llvm.array [2 x builtin.integer i64];
-                op31v1_res0 = llvm.insert_value op30v1_res0[1], op9v5_res0 : llvm.array [2 x builtin.integer i64];
-                op32v1_res0 = llvm.insert_value op28v1_res0[3], op31v1_res0 : llvm.struct <{ llvm.ptr , llvm.ptr , builtin.integer i64, llvm.array [2 x builtin.integer i64], llvm.array [2 x builtin.integer i64] }>;
-                op33v1_res0 = llvm.undef : llvm.array [2 x builtin.integer i64];
-                op34v1_res0 = llvm.insert_value op33v1_res0[0], op15v3_res0 : llvm.array [2 x builtin.integer i64];
-                op35v1_res0 = llvm.insert_value op34v1_res0[1], op4v7_res0 : llvm.array [2 x builtin.integer i64];
-                op36v1_res0 = llvm.insert_value op32v1_res0[4], op35v1_res0 : llvm.struct <{ llvm.ptr , llvm.ptr , builtin.integer i64, llvm.array [2 x builtin.integer i64], llvm.array [2 x builtin.integer i64] }>;
-                op3v3_res0 = llvm.extract_value op36v1_res0[3] : llvm.array [2 x builtin.integer i64];
-                op37v1_res0 = llvm.extract_value op3v3_res0[0] : builtin.integer i64;
-                op38v1_res0 = llvm.extract_value op3v3_res0[1] : builtin.integer i64;
-                op24v3_res0 = llvm.constant <builtin.integer <0: i64>> : builtin.integer i64;
-                op39v3_res0 = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
-                llvm.br ^for_op_header_block10v1(op24v3_res0)
+              ^entry_block2v1(i_res_v13: builtin.integer i64, j_res_v14: builtin.integer i64) !1:
+                v66 = llvm.constant <builtin.integer <16: i64>> : builtin.integer i64;
+                v67 = llvm.constant <builtin.integer <16: i64>> : builtin.integer i64;
+                v68 = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
+                v69 = llvm.constant <builtin.integer <16: i64>> : builtin.integer i64;
+                v70 = llvm.constant <builtin.integer <256: i64>> : builtin.integer i64;
+                v20 = llvm.zero : llvm.ptr ;
+                v21 = llvm.gep <builtin.integer i64> (v20)[Constant(1)] : llvm.ptr ;
+                v22 = llvm.ptrtoint v21 to builtin.integer i64;
+                v23 = llvm.mul v22, v70 <{nsw=false,nuw=false}>: builtin.integer i64;
+                v24 = llvm.call @malloc (v23) : llvm.func <llvm.ptr (builtin.integer i64) variadic = false>;
+                v71 = llvm.constant <builtin.integer <0: i64>> : builtin.integer i64;
+                v26 = llvm.undef : llvm.struct <{ llvm.ptr , llvm.ptr , builtin.integer i64, llvm.array [2 x builtin.integer i64], llvm.array [2 x builtin.integer i64] }>;
+                v27 = llvm.insert_value v26[0], v24 : llvm.struct <{ llvm.ptr , llvm.ptr , builtin.integer i64, llvm.array [2 x builtin.integer i64], llvm.array [2 x builtin.integer i64] }>;
+                v28 = llvm.insert_value v27[1], v24 : llvm.struct <{ llvm.ptr , llvm.ptr , builtin.integer i64, llvm.array [2 x builtin.integer i64], llvm.array [2 x builtin.integer i64] }>;
+                v29 = llvm.insert_value v28[2], v71 : llvm.struct <{ llvm.ptr , llvm.ptr , builtin.integer i64, llvm.array [2 x builtin.integer i64], llvm.array [2 x builtin.integer i64] }>;
+                v30 = llvm.undef : llvm.array [2 x builtin.integer i64];
+                v31 = llvm.insert_value v30[0], v66 : llvm.array [2 x builtin.integer i64];
+                v32 = llvm.insert_value v31[1], v67 : llvm.array [2 x builtin.integer i64];
+                v33 = llvm.insert_value v29[3], v32 : llvm.struct <{ llvm.ptr , llvm.ptr , builtin.integer i64, llvm.array [2 x builtin.integer i64], llvm.array [2 x builtin.integer i64] }>;
+                v34 = llvm.undef : llvm.array [2 x builtin.integer i64];
+                v35 = llvm.insert_value v34[0], v69 : llvm.array [2 x builtin.integer i64];
+                v36 = llvm.insert_value v35[1], v68 : llvm.array [2 x builtin.integer i64];
+                v37 = llvm.insert_value v33[4], v36 : llvm.struct <{ llvm.ptr , llvm.ptr , builtin.integer i64, llvm.array [2 x builtin.integer i64], llvm.array [2 x builtin.integer i64] }>;
+                v38 = llvm.extract_value v37[3] : llvm.array [2 x builtin.integer i64];
+                v39 = llvm.extract_value v38[0] : builtin.integer i64;
+                v40 = llvm.extract_value v38[1] : builtin.integer i64;
+                v72 = llvm.constant <builtin.integer <0: i64>> : builtin.integer i64;
+                v73 = llvm.constant <builtin.integer <1: i64>> : builtin.integer i64;
+                llvm.br ^for_op_header_block10v1(v72)
 
-              ^for_op_header_block10v1(block10v1_arg0: builtin.integer i64) !2:
-                op11v7_res0 = llvm.icmp block10v1_arg0 <ULT> op37v1_res0 : builtin.integer i1;
-                llvm.cond_br if op11v7_res0 ^entry_block6v1(block10v1_arg0) else ^entry_split_block9v1()
+              ^for_op_header_block10v1(v79: builtin.integer i64) !2:
+                v80 = llvm.icmp v79 <ULT> v39 : builtin.integer i1;
+                llvm.cond_br if v80 ^entry_block6v1(v79) else ^entry_split_block9v1()
 
-              ^entry_block6v1(iv_block6v1_arg0: builtin.integer i64) !3:
-                llvm.br ^for_op_header_block8v1(op24v3_res0)
+              ^entry_block6v1(iv_v75: builtin.integer i64) !3:
+                llvm.br ^for_op_header_block8v1(v72)
 
-              ^for_op_header_block8v1(block8v1_arg0: builtin.integer i64):
-                op12v3_res0 = llvm.icmp block8v1_arg0 <ULT> op38v1_res0 : builtin.integer i1;
-                llvm.cond_br if op12v3_res0 ^entry_block5v1(block8v1_arg0) else ^entry_split_block7v1()
+              ^for_op_header_block8v1(v76: builtin.integer i64):
+                v77 = llvm.icmp v76 <ULT> v40 : builtin.integer i1;
+                llvm.cond_br if v77 ^entry_block5v1(v76) else ^entry_split_block7v1()
 
-              ^entry_block5v1(iv_block5v1_arg0: builtin.integer i64) !4:
-                llvm.br ^entry_block4v1(iv_block6v1_arg0, iv_block5v1_arg0)
+              ^entry_block5v1(iv_v74: builtin.integer i64) !4:
+                llvm.br ^entry_block4v1(iv_v75, iv_v74)
 
-              ^entry_block4v1(block4v1_arg0: builtin.integer i64, block4v1_arg1: builtin.integer i64):
-                llvm.br ^entry_block1v1(block4v1_arg0, block4v1_arg1)
+              ^entry_block4v1(v43: builtin.integer i64, v44: builtin.integer i64):
+                llvm.br ^entry_block1v1(v43, v44)
 
-              ^entry_block1v1(i_block1v1_arg0: builtin.integer i64, j_block1v1_arg1: builtin.integer i64) !5:
-                sum_op10v1_res0 = llvm.add i_block1v1_arg0, j_res_block2v1_arg1 <{nsw=false,nuw=false}>: builtin.integer i64 !6;
-                op13v3_res0 = llvm.extract_value op36v1_res0[1] : llvm.ptr ;
-                op54v1_res0 = llvm.extract_value op36v1_res0[4] : llvm.array [2 x builtin.integer i64];
-                op55v1_res0 = llvm.extract_value op54v1_res0[0] : builtin.integer i64;
-                op56v1_res0 = llvm.extract_value op54v1_res0[1] : builtin.integer i64;
-                op57v1_res0 = llvm.extract_value op36v1_res0[2] : builtin.integer i64;
-                op58v1_res0 = llvm.gep <builtin.integer i64> (op13v3_res0, op57v1_res0)[OperandIdx(1)] : llvm.ptr ;
-                op59v1_res0 = llvm.mul op55v1_res0, i_block1v1_arg0 <{nsw=false,nuw=false}>: builtin.integer i64;
-                op60v1_res0 = llvm.mul op56v1_res0, j_block1v1_arg1 <{nsw=false,nuw=false}>: builtin.integer i64;
-                op61v1_res0 = llvm.add op60v1_res0, op59v1_res0 <{nsw=false,nuw=false}>: builtin.integer i64;
-                op62v1_res0 = llvm.gep <builtin.integer i64> (op58v1_res0, op61v1_res0)[OperandIdx(1)] : llvm.ptr ;
-                llvm.store *op62v1_res0 <- sum_op10v1_res0  !7;
-                op6v3_res0 = llvm.add iv_block5v1_arg0, op39v3_res0 <{nsw=false,nuw=false}>: builtin.integer i64;
-                llvm.br ^for_op_header_block8v1(op6v3_res0)
+              ^entry_block1v1(i_v7: builtin.integer i64, j_v8: builtin.integer i64) !5:
+                sum_v6 = llvm.add i_v7, j_res_v14 <{nsw=false,nuw=false}>: builtin.integer i64 !6;
+                v56 = llvm.extract_value v37[1] : llvm.ptr ;
+                v57 = llvm.extract_value v37[4] : llvm.array [2 x builtin.integer i64];
+                v58 = llvm.extract_value v57[0] : builtin.integer i64;
+                v59 = llvm.extract_value v57[1] : builtin.integer i64;
+                v60 = llvm.extract_value v37[2] : builtin.integer i64;
+                v61 = llvm.gep <builtin.integer i64> (v56, v60)[OperandIdx(1)] : llvm.ptr ;
+                v62 = llvm.mul v58, i_v7 <{nsw=false,nuw=false}>: builtin.integer i64;
+                v63 = llvm.mul v59, j_v8 <{nsw=false,nuw=false}>: builtin.integer i64;
+                v64 = llvm.add v63, v62 <{nsw=false,nuw=false}>: builtin.integer i64;
+                v65 = llvm.gep <builtin.integer i64> (v61, v64)[OperandIdx(1)] : llvm.ptr ;
+                llvm.store *v65 <- sum_v6  !7;
+                v78 = llvm.add iv_v74, v73 <{nsw=false,nuw=false}>: builtin.integer i64;
+                llvm.br ^for_op_header_block8v1(v78)
 
               ^entry_split_block7v1():
-                op68v1_res0 = llvm.add iv_block6v1_arg0, op39v3_res0 <{nsw=false,nuw=false}>: builtin.integer i64;
-                llvm.br ^for_op_header_block10v1(op68v1_res0)
+                v81 = llvm.add iv_v75, v73 <{nsw=false,nuw=false}>: builtin.integer i64;
+                llvm.br ^for_op_header_block10v1(v81)
 
               ^entry_split_block9v1():
-                op7v5_res0 = llvm.extract_value op36v1_res0[1] : llvm.ptr ;
-                op44v1_res0 = llvm.extract_value op36v1_res0[4] : llvm.array [2 x builtin.integer i64];
-                op45v1_res0 = llvm.extract_value op44v1_res0[0] : builtin.integer i64;
-                op46v1_res0 = llvm.extract_value op44v1_res0[1] : builtin.integer i64;
-                op47v1_res0 = llvm.extract_value op36v1_res0[2] : builtin.integer i64;
-                op48v1_res0 = llvm.gep <builtin.integer i64> (op7v5_res0, op47v1_res0)[OperandIdx(1)] : llvm.ptr ;
-                op49v1_res0 = llvm.mul op45v1_res0, i_res_block2v1_arg0 <{nsw=false,nuw=false}>: builtin.integer i64;
-                op50v1_res0 = llvm.mul op46v1_res0, j_res_block2v1_arg1 <{nsw=false,nuw=false}>: builtin.integer i64;
-                op51v1_res0 = llvm.add op50v1_res0, op49v1_res0 <{nsw=false,nuw=false}>: builtin.integer i64;
-                op52v1_res0 = llvm.gep <builtin.integer i64> (op48v1_res0, op51v1_res0)[OperandIdx(1)] : llvm.ptr ;
-                op53v1_res0 = llvm.load op52v1_res0  : builtin.integer i64 !8;
-                llvm.return op53v1_res0 !9
+                v45 = llvm.extract_value v37[1] : llvm.ptr ;
+                v46 = llvm.extract_value v37[4] : llvm.array [2 x builtin.integer i64];
+                v47 = llvm.extract_value v46[0] : builtin.integer i64;
+                v48 = llvm.extract_value v46[1] : builtin.integer i64;
+                v49 = llvm.extract_value v37[2] : builtin.integer i64;
+                v50 = llvm.gep <builtin.integer i64> (v45, v49)[OperandIdx(1)] : llvm.ptr ;
+                v51 = llvm.mul v47, i_res_v13 <{nsw=false,nuw=false}>: builtin.integer i64;
+                v52 = llvm.mul v48, j_res_v14 <{nsw=false,nuw=false}>: builtin.integer i64;
+                v53 = llvm.add v52, v51 <{nsw=false,nuw=false}>: builtin.integer i64;
+                v54 = llvm.gep <builtin.integer i64> (v50, v53)[OperandIdx(1)] : llvm.ptr ;
+                v55 = llvm.load v54  : builtin.integer i64 !8;
+                llvm.return v55 !9
             } !10;
             llvm.func @malloc: llvm.func <llvm.ptr (builtin.integer i64) variadic = false>
               []
@@ -169,76 +169,76 @@ fn test_alloc_generate() {
 
         define i64 @test_alloc_generate(i64 %0, i64 %1) {
         entry_block2v1:
-          %op21v1_res0 = mul i64 ptrtoint (ptr getelementptr (i64, ptr null, i32 1) to i64), 256
-          %op23v1_res0 = call ptr @malloc(i64 %op21v1_res0)
-          %op26v1_res0 = insertvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } undef, ptr %op23v1_res0, 0
-          %op27v1_res0 = insertvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %op26v1_res0, ptr %op23v1_res0, 1
-          %op28v1_res0 = insertvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %op27v1_res0, i64 0, 2
-          %op32v1_res0 = insertvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %op28v1_res0, [2 x i64] [i64 16, i64 16], 3
-          %op36v1_res0 = insertvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %op32v1_res0, [2 x i64] [i64 16, i64 1], 4
-          %op3v3_res0 = extractvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %op36v1_res0, 3
-          %op37v1_res0 = extractvalue [2 x i64] %op3v3_res0, 0
-          %op38v1_res0 = extractvalue [2 x i64] %op3v3_res0, 1
+          %v23 = mul i64 ptrtoint (ptr getelementptr (i64, ptr null, i32 1) to i64), 256
+          %v24 = call ptr @malloc(i64 %v23)
+          %v27 = insertvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } undef, ptr %v24, 0
+          %v28 = insertvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %v27, ptr %v24, 1
+          %v29 = insertvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %v28, i64 0, 2
+          %v33 = insertvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %v29, [2 x i64] [i64 16, i64 16], 3
+          %v37 = insertvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %v33, [2 x i64] [i64 16, i64 1], 4
+          %v38 = extractvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %v37, 3
+          %v39 = extractvalue [2 x i64] %v38, 0
+          %v40 = extractvalue [2 x i64] %v38, 1
           br label %for_op_header_block10v1
 
         for_op_header_block10v1:                          ; preds = %entry_split_block7v1, %entry_block2v1
-          %block10v1_arg0 = phi i64 [ 0, %entry_block2v1 ], [ %op68v1_res0, %entry_split_block7v1 ]
-          %op11v7_res0 = icmp ult i64 %block10v1_arg0, %op37v1_res0
-          br i1 %op11v7_res0, label %entry_block6v1, label %entry_split_block9v1
+          %v79 = phi i64 [ 0, %entry_block2v1 ], [ %v81, %entry_split_block7v1 ]
+          %v80 = icmp ult i64 %v79, %v39
+          br i1 %v80, label %entry_block6v1, label %entry_split_block9v1
 
         entry_block6v1:                                   ; preds = %for_op_header_block10v1
-          %iv_block6v1_arg0 = phi i64 [ %block10v1_arg0, %for_op_header_block10v1 ]
+          %iv_v75 = phi i64 [ %v79, %for_op_header_block10v1 ]
           br label %for_op_header_block8v1
 
         for_op_header_block8v1:                           ; preds = %entry_block1v1, %entry_block6v1
-          %block8v1_arg0 = phi i64 [ 0, %entry_block6v1 ], [ %op6v3_res0, %entry_block1v1 ]
-          %op12v3_res0 = icmp ult i64 %block8v1_arg0, %op38v1_res0
-          br i1 %op12v3_res0, label %entry_block5v1, label %entry_split_block7v1
+          %v76 = phi i64 [ 0, %entry_block6v1 ], [ %v78, %entry_block1v1 ]
+          %v77 = icmp ult i64 %v76, %v40
+          br i1 %v77, label %entry_block5v1, label %entry_split_block7v1
 
         entry_block5v1:                                   ; preds = %for_op_header_block8v1
-          %iv_block5v1_arg0 = phi i64 [ %block8v1_arg0, %for_op_header_block8v1 ]
+          %iv_v74 = phi i64 [ %v76, %for_op_header_block8v1 ]
           br label %entry_block4v1
 
         entry_block4v1:                                   ; preds = %entry_block5v1
-          %block4v1_arg0 = phi i64 [ %iv_block6v1_arg0, %entry_block5v1 ]
-          %block4v1_arg1 = phi i64 [ %iv_block5v1_arg0, %entry_block5v1 ]
+          %v43 = phi i64 [ %iv_v75, %entry_block5v1 ]
+          %v44 = phi i64 [ %iv_v74, %entry_block5v1 ]
           br label %entry_block1v1
 
         entry_block1v1:                                   ; preds = %entry_block4v1
-          %i_block1v1_arg0 = phi i64 [ %block4v1_arg0, %entry_block4v1 ]
-          %j_block1v1_arg1 = phi i64 [ %block4v1_arg1, %entry_block4v1 ]
-          %sum_op10v1_res0 = add i64 %i_block1v1_arg0, %1
-          %op13v3_res0 = extractvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %op36v1_res0, 1
-          %op54v1_res0 = extractvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %op36v1_res0, 4
-          %op55v1_res0 = extractvalue [2 x i64] %op54v1_res0, 0
-          %op56v1_res0 = extractvalue [2 x i64] %op54v1_res0, 1
-          %op57v1_res0 = extractvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %op36v1_res0, 2
-          %op58v1_res0 = getelementptr i64, ptr %op13v3_res0, i64 %op57v1_res0
-          %op59v1_res0 = mul i64 %op55v1_res0, %i_block1v1_arg0
-          %op60v1_res0 = mul i64 %op56v1_res0, %j_block1v1_arg1
-          %op61v1_res0 = add i64 %op60v1_res0, %op59v1_res0
-          %op62v1_res0 = getelementptr i64, ptr %op58v1_res0, i64 %op61v1_res0
-          store i64 %sum_op10v1_res0, ptr %op62v1_res0, align 4
-          %op6v3_res0 = add i64 %iv_block5v1_arg0, 1
+          %i_v7 = phi i64 [ %v43, %entry_block4v1 ]
+          %j_v8 = phi i64 [ %v44, %entry_block4v1 ]
+          %sum_v6 = add i64 %i_v7, %1
+          %v56 = extractvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %v37, 1
+          %v57 = extractvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %v37, 4
+          %v58 = extractvalue [2 x i64] %v57, 0
+          %v59 = extractvalue [2 x i64] %v57, 1
+          %v60 = extractvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %v37, 2
+          %v61 = getelementptr i64, ptr %v56, i64 %v60
+          %v62 = mul i64 %v58, %i_v7
+          %v63 = mul i64 %v59, %j_v8
+          %v64 = add i64 %v63, %v62
+          %v65 = getelementptr i64, ptr %v61, i64 %v64
+          store i64 %sum_v6, ptr %v65, align 4
+          %v78 = add i64 %iv_v74, 1
           br label %for_op_header_block8v1
 
         entry_split_block7v1:                             ; preds = %for_op_header_block8v1
-          %op68v1_res0 = add i64 %iv_block6v1_arg0, 1
+          %v81 = add i64 %iv_v75, 1
           br label %for_op_header_block10v1
 
         entry_split_block9v1:                             ; preds = %for_op_header_block10v1
-          %op7v5_res0 = extractvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %op36v1_res0, 1
-          %op44v1_res0 = extractvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %op36v1_res0, 4
-          %op45v1_res0 = extractvalue [2 x i64] %op44v1_res0, 0
-          %op46v1_res0 = extractvalue [2 x i64] %op44v1_res0, 1
-          %op47v1_res0 = extractvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %op36v1_res0, 2
-          %op48v1_res0 = getelementptr i64, ptr %op7v5_res0, i64 %op47v1_res0
-          %op49v1_res0 = mul i64 %op45v1_res0, %0
-          %op50v1_res0 = mul i64 %op46v1_res0, %1
-          %op51v1_res0 = add i64 %op50v1_res0, %op49v1_res0
-          %op52v1_res0 = getelementptr i64, ptr %op48v1_res0, i64 %op51v1_res0
-          %op53v1_res0 = load i64, ptr %op52v1_res0, align 4
-          ret i64 %op53v1_res0
+          %v45 = extractvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %v37, 1
+          %v46 = extractvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %v37, 4
+          %v47 = extractvalue [2 x i64] %v46, 0
+          %v48 = extractvalue [2 x i64] %v46, 1
+          %v49 = extractvalue { ptr, ptr, i64, [2 x i64], [2 x i64] } %v37, 2
+          %v50 = getelementptr i64, ptr %v45, i64 %v49
+          %v51 = mul i64 %v47, %0
+          %v52 = mul i64 %v48, %1
+          %v53 = add i64 %v52, %v51
+          %v54 = getelementptr i64, ptr %v50, i64 %v53
+          %v55 = load i64, ptr %v54, align 4
+          ret i64 %v55
         }
 
         declare ptr @malloc(i64)

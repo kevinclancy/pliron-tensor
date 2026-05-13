@@ -25,7 +25,7 @@ use pliron::{
     result::Result,
     symbol_table::{SymbolTableCollection, nearest_symbol_table},
     r#type::{TypeObj, TypePtr, Typed, type_cast, type_impls},
-    value::Value,
+    value::{DefEntity, Value},
 };
 use pliron_common_dialects::{
     cf::{ToCFDialect, op_interfaces::YieldingRegion, ops::NDForOp},
@@ -333,9 +333,9 @@ impl ToCFDialect for DimOp {
         let memref = self.get_source_memref(ctx);
         let dim_idx = self.get_dimension_index(ctx);
 
-        let dim_size = match dim_idx {
+        let dim_size = match dim_idx.def_entity() {
             // If the dimension index is a constant, it's more efficient to use `unpack_size`.
-            Value::OpResult { op, .. }
+            DefEntity::OpResult(op)
                 if let Some(index_const_op) = Operation::get_op::<IndexConstantOp>(op, ctx) =>
             {
                 let dim = index_const_op

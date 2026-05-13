@@ -47,7 +47,7 @@ use pliron::{
     operation::Operation,
     result::Result,
     r#type::{TypeObj, TypePtr, Typed, type_cast, type_impls},
-    value::{Use, Value},
+    value::{DefEntity, Use, Value},
     verify_err_noloc,
 };
 use pliron_common_dialects::{
@@ -149,10 +149,10 @@ pub enum AliasErr {
 
 impl Verify for Alias {
     fn verify(&self, _ctx: &Context) -> Result<()> {
-        let Value::OpResult { op, .. } = self.result else {
+        let DefEntity::OpResult(op) = self.result.def_entity() else {
             return verify_err_noloc!(AliasErr::InvalidAlias);
         };
-        if self.operand.user_op != op {
+        if self.operand.user_op() != op {
             return verify_err_noloc!(AliasErr::InvalidAlias);
         }
         Ok(())
@@ -401,7 +401,7 @@ impl<'tmm, TMM: TensorMemoryManager> DialectConversion for Bufferizer<'tmm, TMM>
             let copy_op = CopyOp::new(ctx, new_buffer, opd.get_def(ctx));
             rewriter.append_op(ctx, copy_op);
             // Replace the operand with the new buffer.
-            Operation::replace_operand(op, ctx, opd.opd_idx, new_buffer);
+            Operation::replace_operand(op, ctx, opd.find_index(ctx), new_buffer);
         }
 
         // Rewrite the op to use memref semantics.

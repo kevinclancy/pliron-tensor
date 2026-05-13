@@ -180,8 +180,8 @@ impl BufferizableOpInterface for GenerateOp {
 
 #[op_interface_impl]
 impl BufferizableOpInterface for ExtractOp {
-    fn operand_bufferizes_to_memory_read(&self, _ctx: &Context, opd: Use<Value>) -> bool {
-        opd.opd_idx == 0
+    fn operand_bufferizes_to_memory_read(&self, ctx: &Context, opd: Use<Value>) -> bool {
+        self.get_operation().deref(ctx).get_operand_as_use(0) == opd
     }
 
     fn operand_bufferizes_to_memory_write(&self, _ctx: &Context, _opd: Use<Value>) -> bool {
@@ -852,8 +852,8 @@ pub fn lower_func_op_to_llvm(func_op: &FuncOp, ctx: &mut Context) -> Result<()> 
 
 #[op_interface_impl]
 impl BufferizableOpInterface for TensorExtractSliceOp {
-    fn operand_bufferizes_to_memory_read(&self, _ctx: &Context, opd: Use<Value>) -> bool {
-        opd.opd_idx == 0
+    fn operand_bufferizes_to_memory_read(&self, ctx: &Context, opd: Use<Value>) -> bool {
+        self.get_operation().deref(ctx).get_operand_as_use(0) == opd
     }
 
     fn operand_bufferizes_to_memory_write(&self, _ctx: &Context, _opd: Use<Value>) -> bool {
@@ -900,17 +900,12 @@ impl BufferizableOpInterface for TensorInsertSliceOp {
         true
     }
 
-    fn operand_bufferizes_to_memory_write(&self, _ctx: &Context, opd: Use<Value>) -> bool {
-        opd.opd_idx == 1
+    fn operand_bufferizes_to_memory_write(&self, ctx: &Context, opd: Use<Value>) -> bool {
+        self.get_operation().deref(ctx).get_operand_as_use(1) == opd
     }
 
     fn get_operand_result_aliases(&self, ctx: &Context) -> Vec<Alias> {
-        let operand = self
-            .get_operation()
-            .deref(ctx)
-            .operands_as_uses()
-            .find(|opd| opd.opd_idx == 1)
-            .expect("InsertSliceOp must have operand 1");
+        let operand = self.get_operation().deref(ctx).get_operand_as_use(1);
         vec![Alias {
             operand,
             result: self.get_result(ctx),
@@ -950,8 +945,8 @@ impl BufferizableOpInterface for TensorInsertSliceOp {
 
 #[op_interface_impl]
 impl BufferizableOpInterface for TensorReshapeOp {
-    fn operand_bufferizes_to_memory_read(&self, _ctx: &Context, opd: Use<Value>) -> bool {
-        opd.opd_idx == 0
+    fn operand_bufferizes_to_memory_read(&self, ctx: &Context, opd: Use<Value>) -> bool {
+        self.get_operation().deref(ctx).get_operand_as_use(0) == opd
     }
 
     fn operand_bufferizes_to_memory_write(&self, _ctx: &Context, _opd: Use<Value>) -> bool {
@@ -959,12 +954,7 @@ impl BufferizableOpInterface for TensorReshapeOp {
     }
 
     fn get_operand_result_aliases(&self, ctx: &Context) -> Vec<Alias> {
-        let operand = self
-            .get_operation()
-            .deref(ctx)
-            .operands_as_uses()
-            .find(|opd| opd.opd_idx == 0)
-            .expect("ReshapeOp must have operand 0");
+        let operand = self.get_operation().deref(ctx).get_operand_as_use(0);
         vec![Alias {
             operand,
             result: self.get_result(ctx),

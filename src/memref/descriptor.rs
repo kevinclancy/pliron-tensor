@@ -558,11 +558,11 @@ mod tests {
                   [] 
                 {
                   ^entry_block2v1():
-                    op3v1_res0 = index.constant <index.constant 4> : index.index ;
-                    op4v1_res0 = index.constant <index.constant 8> : index.index ;
-                    op5v1_res0 = index.constant <index.constant 1> : index.index ;
-                    op6v1_res0 = index.constant <index.constant 8> : index.index ;
-                    op7v1_res0 = index.constant <index.constant 32> : index.index ;
+                    v0 = index.constant <index.constant 4> : index.index ;
+                    v1 = index.constant <index.constant 8> : index.index ;
+                    v2 = index.constant <index.constant 1> : index.index ;
+                    v3 = index.constant <index.constant 8> : index.index ;
+                    v4 = index.constant <index.constant 32> : index.index ;
                     llvm.return 
                 }
             }"#]]
@@ -572,14 +572,14 @@ mod tests {
             .map(|v| v.disp(ctx).to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        expect!["op3v1_res0, op4v1_res0"].assert_eq(&sizes_printed);
+        expect!["v0, v1"].assert_eq(&sizes_printed);
         let strides_printed = strides
             .iter()
             .map(|v| v.disp(ctx).to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        expect!["op6v1_res0, op5v1_res0"].assert_eq(&strides_printed);
-        expect!["op7v1_res0"].assert_eq(&total_elements.disp(ctx).to_string());
+        expect!["v3, v2"].assert_eq(&strides_printed);
+        expect!["v4"].assert_eq(&total_elements.disp(ctx).to_string());
     }
 
     /// Test the `compute_sizes_strides` function with a memref type that has dynamic dimensions.
@@ -628,12 +628,12 @@ mod tests {
                   [] 
                 {
                   ^entry_block2v1():
-                    op3v1_res0 = index.constant <index.constant 4> : index.index ;
-                    op4v1_res0 = index.constant <index.constant 8> : index.index ;
-                    op5v1_res0 = index.constant <index.constant 1> : index.index ;
-                    op6v1_res0 = index.constant <index.constant 1> : index.index ;
-                    op7v1_res0 = llvm.mul op6v1_res0, op4v1_res0 <{nsw=false,nuw=false}>: index.index ;
-                    op8v1_res0 = llvm.mul op7v1_res0, op3v1_res0 <{nsw=false,nuw=false}>: index.index ;
+                    v0 = index.constant <index.constant 4> : index.index ;
+                    v1 = index.constant <index.constant 8> : index.index ;
+                    v2 = index.constant <index.constant 1> : index.index ;
+                    v3 = index.constant <index.constant 1> : index.index ;
+                    v4 = llvm.mul v3, v1 <{nsw=false,nuw=false}>: index.index ;
+                    v5 = llvm.mul v4, v0 <{nsw=false,nuw=false}>: index.index ;
                     llvm.return 
                 }
             }"#]]
@@ -643,13 +643,13 @@ mod tests {
             .map(|v| v.disp(ctx).to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        expect!["op3v1_res0, op4v1_res0"].assert_eq(&sizes_printed);
+        expect!["v0, v1"].assert_eq(&sizes_printed);
         let strides_printed = strides
             .iter()
             .map(|v| v.disp(ctx).to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        expect!["op7v1_res0, op5v1_res0"].assert_eq(&strides_printed);
-        expect!["op8v1_res0"].assert_eq(&total_elements.disp(ctx).to_string());
+        expect!["v4, v2"].assert_eq(&strides_printed);
+        expect!["v5"].assert_eq(&total_elements.disp(ctx).to_string());
     }
 }
