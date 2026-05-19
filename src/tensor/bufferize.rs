@@ -47,7 +47,7 @@ use pliron::{
     operation::Operation,
     result::Result,
     r#type::{TypeObj, TypePtr, Typed, type_cast, type_impls},
-    value::{DefEntity, Use, Value},
+    value::{DefiningEntity, Use, Value},
     verify_err_noloc,
 };
 use pliron_common_dialects::{
@@ -149,7 +149,7 @@ pub enum AliasErr {
 
 impl Verify for Alias {
     fn verify(&self, _ctx: &Context) -> Result<()> {
-        let DefEntity::OpResult(op) = self.result.def_entity() else {
+        let DefiningEntity::Op(op) = self.result.defining_entity() else {
             return verify_err_noloc!(AliasErr::InvalidAlias);
         };
         if self.operand.user_op() != op {
